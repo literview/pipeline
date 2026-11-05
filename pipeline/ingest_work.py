@@ -25,6 +25,7 @@ No module-level side effects: importing this file opens no connection and reads 
 from __future__ import annotations
 
 import re
+from urllib.parse import unquote, urlsplit
 
 try:  # consumers that put pipeline/ on sys.path (every pipeline script)
     from journals_config import JOURNALS_BY_DISCIPLINE
@@ -152,6 +153,80 @@ def biblio_from_crossref(item: dict) -> dict:
     return out
 
 
+# ── appendix and supplement links (ledger task aea-appx-pdf-url) ─────────────
+# OpenAlex's `open_access.oa_url` is, for some works, a repository copy of the article's online
+# appendix or supplement (RePEc `.appx` for AEA, Wiley `-sup-NNNN` supporting information, an
+# institutional repository's appendix file), and storing it as `pdf_url` sent "Open PDF" and
+# Get PDF to the appendix. The same rule runs in lib/library/supplement-url.ts on Unpaywall
+# candidates; both are tested against lib/library/supplement-url.fixture.json.
+
+_APPX_PATH = re.compile(r"\.appx$", re.I)
+_SUP_NUMBER = re.compile(r"-sup-\d{4}")
+_SUPP_DIRS = {"supp", "suppl", "supplement", "supplements", "supplementary", "supplemental",
+              "suppinfo", "appendix", "appendices"}
+_ISSUE_SUPP = re.compile(r"\.supp\.s?\d+$")
+_SUPP_WORD = re.compile(r"(?<![a-z])(online[ _-]?)?(appendix|appendices|appendixes|supplement"
+                        r"|supplementary|supplemental|supp)(?![a-z])")
+_NOT_SUPP_WORD = re.compile(r"(?<![a-z])(with|without|no|main|manuscript)(?![a-z])")
+
+
+def _supplement_clause(url) -> str | None:
+    """The clause of the rule that marks `url` as an appendix or supplement ('1', '2', '3a',
+    '3b' or '3d'), or None. Only an absolute http(s) URL with a host can match."""
+    if not isinstance(url, str):
+        return None
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in ("http", "https") or not parts.hostname:
+        return None
+    path = parts.path
+    if _APPX_PATH.search(path):
+        return "1"
+    if parts.hostname.lower() == "supp.apa.org" and "/supplemental/" in path:
+        return "2"
+    segments = [unquote(s).lower() for s in path.split("/") if s]
+    name = segments[-1] if segments else ""
+    if _SUP_NUMBER.search(name):
+        return "3a"
+    if any(s in _SUPP_DIRS for s in segments[:-1]):
+        return "3b"
+    if "div-class-title" in name or _ISSUE_SUPP.search(name):
+        return None
+    if _SUPP_WORD.search(name) and not _NOT_SUPP_WORD.search(name):
+        return "3d"
+    return None
+
+
+def is_supplement_pdf_url(url) -> bool:
+    """True when `url` is a link to an article's online appendix or supplement, not the article."""
+    return _supplement_clause(url) is not None
+
+
+def openalex_pdf_url(work: dict) -> str | None:
+    """The PDF link to store for an OpenAlex work: the first non-empty value among
+    `open_access.oa_url`, `best_oa_location.pdf_url` and the `pdf_url` of each open-access entry
+    of `locations` (OpenAlex's order) that is not an appendix or supplement. Each skipped link
+    is logged once, so the crawler's run logs show every link the rule removed."""
+    candidates = [(work.get("open_access") or {}).get("oa_url"),
+                  (work.get("best_oa_location") or {}).get("pdf_url")]
+    candidates += [(loc or {}).get("pdf_url") for loc in work.get("locations") or []
+                   if (loc or {}).get("is_oa")]
+    skipped = set()
+    for url in candidates:
+        if not url:
+            continue
+        clause = _supplement_clause(url)
+        if clause is None:
+            return url
+        if url not in skipped:
+            skipped.add(url)
+            print(f"[ingest] supplement pdf_url skipped work={work.get('id')} url={url} "
+                  f"clause={clause}", flush=True)
+    return None
+
+
 # ── normalizers ──────────────────────────────────────────────────────────────
 
 def normalize_openalex(work: dict) -> dict | None:
@@ -181,9 +256,7 @@ def normalize_openalex(work: dict) -> dict | None:
         })
 
     url = work.get("doi") or work.get("id")
-    pdf_url = None
-    if (work.get("open_access") or {}).get("oa_url"):
-        pdf_url = work["open_access"]["oa_url"]
+    pdf_url = openalex_pdf_url(work)
 
     source = None
     source_openalex_id = None

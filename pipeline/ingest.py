@@ -17,7 +17,7 @@ from tenacity import retry, stop_after_attempt, wait_exponential
 
 from db import get_client, upsert_paper, link_paper_to_discipline, link_paper_to_tag, get_disciplines_map, get_tags_map
 from text_norm import is_truncated_preview
-from ingest_work import biblio_from_openalex  # volume, issue, pages (migration 068)
+from ingest_work import biblio_from_openalex, openalex_pdf_url  # biblio: migration 068
 
 load_dotenv()
 
@@ -460,9 +460,7 @@ def normalize_openalex(work: dict) -> dict | None:
 
     # Get best available URL
     url = work.get("doi") or work.get("id")
-    pdf_url = None
-    if work.get("open_access", {}).get("oa_url"):
-        pdf_url = work["open_access"]["oa_url"]
+    pdf_url = openalex_pdf_url(work)
 
     # Extract source (journal/venue name)
     source = None
