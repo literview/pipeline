@@ -1,0 +1,71 @@
+name: Neon compute guard
+
+# Ledger task neon-cu-guard (docs/SCALING_PLAN.md N2). Once a day, reads the Neon production
+# branch's compute counter, keeps the last 10 daily readings in the Actions cache, and e-mails the
+# owner when one day used more than 1.5 times the mean of the seven days before it. The new 8 CU
+# maximum ($0.85 an hour) makes a runaway cost about $20 a day, so it has to be seen within a day.
+#
+# The state is a cache entry, not a file in the repo: each run saves under its own key
+# (neon-cu-guard-<run_id>) and restores the newest earlier one by prefix. This repository is
+# public, so the script prints only the verdict and the date; the figures go in the e-mail.
+
+on:
+  schedule:
+    - cron: '40 7 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: neon-cu-guard
+  cancel-in-progress: false
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: neon_cu_state.json
+          key: neon-cu-guard-${{ github.run_id }}
+          restore-keys: neon-cu-guard-
+
+      - name: Check Neon compute usage
+        env:
+          NEON_API_KEY: ${{ secrets.NEON_API_KEY }}
+          NEON_PROJECT_ID: ${{ secrets.NEON_PROJECT_ID }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: python pipeline/neon_cu_guard.py --state neon_cu_state.json
+
+      # always(): the reading is kept when the verdict step fails after writing it, and on alert.
+      - name: Save state
+        if: always() && hashFiles('neon_cu_state.json') != ''
+        uses: actions/cache/save@v4
+        with:
+          path: neon_cu_state.json
+          key: neon-cu-guard-${{ github.run_id }}
+
+      - name: Notify on failure (email)
+        if: failure()
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python3 pipeline/alert_email.py \
+            --title "[URGENT] LiterView neon-cu-guard FAILED" \
+            --body "neon-cu-guard.yml failed, so Neon compute usage is not being watched. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

@@ -1,0 +1,97 @@
+name: Cron Monitor
+
+# Safety net for the ingest/recovery/classify crons. The per-workflow notify
+# steps catch *active* failures; this catches the two modes they can't:
+#   1. Silent staleness  -> ingest "succeeded" but no papers actually landed
+#      (e.g. an upstream API schema change), by checking DB freshness directly.
+#   2. Total cron death   -> GitHub auto-disables scheduled workflows after 60
+#      days of no repo commits; the monthly heartbeat commit keeps the clock
+#      reset so the crons don't silently stop after the repo goes quiet.
+
+on:
+  schedule:
+    - cron: '20 */6 * * *'   # a bit after each ingest cycle
+  workflow_dispatch:
+
+permissions:
+  contents: write            # for the heartbeat commit
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          pip install --upgrade pip
+          pip install psycopg2-binary
+
+      - name: Freshness watchdog
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python - <<'PY'
+          import os, subprocess, psycopg2
+
+          # Ingest runs every 6h. Alert if the newest paper is older than ~14h
+          # (two missed cycles + scheduling jitter) => ingest is likely down.
+          THRESH_H = 14
+
+          conn = psycopg2.connect(os.environ["DATABASE_URL"])
+          cur = conn.cursor()
+          cur.execute("SELECT EXTRACT(EPOCH FROM (now() - MAX(created_at)))/3600.0 FROM papers")
+          row = cur.fetchone()
+          hours = row[0] if row and row[0] is not None else None
+          print(f"Hours since newest paper: {hours}")
+
+          if hours is not None and hours > THRESH_H:
+              msg = (f"No new papers in {hours:.1f}h (threshold {THRESH_H}h) - "
+                     f"ingest cron may be down or auto-disabled.")
+              print("STALE:", msg)
+              # One shared sender for the whole estate (pipeline/alert_email.py):
+              # alerts moved off ntfy on 2026-08-19 because nothing it published
+              # ever reached the owner's phone. LESSONS L015.
+              subprocess.run(["python3", "pipeline/alert_email.py",
+                              "--title", "[URGENT] LiterView ingest STALE",
+                              "--body", msg], check=False)
+          PY
+
+      - name: Heartbeat (defeat 60-day scheduled-workflow auto-disable)
+        if: always()
+        run: |
+          last=$(cat .heartbeat 2>/dev/null || echo "1970-01-01")
+          now_s=$(date -u +%s)
+          last_s=$(date -u -d "$last" +%s 2>/dev/null || echo 0)
+          age_days=$(( (now_s - last_s) / 86400 ))
+          if [ "$age_days" -ge 25 ]; then
+            date -u +%Y-%m-%d > .heartbeat
+            git config user.name "cron-monitor[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add .heartbeat
+            git commit -m "chore: monitor heartbeat [skip ci]" && git push || echo "heartbeat commit/push skipped"
+          else
+            echo "heartbeat is ${age_days}d old (<25d); no commit needed"
+          fi
+
+      - name: Notify on failure (email)
+        if: failure()
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python3 pipeline/alert_email.py \
+            --title "[URGENT] LiterView cron-monitor FAILED" \
+            --body "monitor.yml failed (DB unreachable?). A dead monitor hides a dead pipeline. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

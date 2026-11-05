@@ -1,0 +1,79 @@
+name: Drain the library capture queue
+
+# LiterView capture ingest (ledger task capture-drain-ingest, design item 8; owner decision O2,
+# docs/CAPTURE_INGEST_VETTING_DESIGN.md section 4). A capture that misses the corpus leaves one
+# library_capture_queue row; the capture route resolves the work seconds later and sends a
+# repository_dispatch here, so the paper is in the corpus about a minute after the click instead
+# of at the next six-hour crawl.
+#
+# Two triggers. The dispatch is the fast path and needs a fine-grained token on the Vercel side
+# (repository academic-crawler only, Contents read and write); until that token exists the
+# 30-minute schedule alone runs the drain, and the schedule remains the backstop for a dispatch
+# that was lost or was never sent. ingest.yml keeps its own drain step at the end of each crawl.
+#
+# The concurrency group is this workflow's own, NOT shared with ingest.yml: the drain claims its
+# rows with FOR UPDATE SKIP LOCKED and takes a per-paper advisory lock, so overlapping the
+# crawl's drain step is safe, while sharing a group would queue every capture behind a
+# nine-minute crawl and throw away the latency this workflow exists to buy. cancel-in-progress is
+# false because GitHub keeps one running and one pending run per group, so a burst of captures
+# collapses into a single follow-up run instead of cancelling work mid-transaction.
+#
+# This repository is public, so the drain's own logs print queue ids, DOIs, arXiv ids and paper
+# ids only — never a user id and never the stored record. The 60-day auto-disable of scheduled
+# workflows in a public repository is covered by gh-cron-watchdog.
+
+on:
+  repository_dispatch:
+    types: [drain]
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: drain
+  cancel-in-progress: false
+
+jobs:
+  drain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-ingest.txt
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-ingest.txt
+
+      - name: Drain the capture queue
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          OPENALEX_EMAIL: ${{ secrets.OPENALEX_EMAIL }}
+          SITE_URL: ${{ secrets.SITE_URL }}
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          VERCEL_PROTECTION_BYPASS: ${{ secrets.VERCEL_PROTECTION_BYPASS }}
+        working-directory: pipeline
+        run: python drain_capture_queue.py --limit 200
+
+      # The same failure step the other workflows use. ingest.yml's header calls it the ntfy
+      # step; alerts actually moved off ntfy to e-mail on 2026-08-19 (LESSONS L015) because
+      # nothing ntfy published ever reached the owner's phone, and this follows the live code.
+      - name: Notify on failure (email)
+        if: failure()
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python3 pipeline/alert_email.py \
+            --title "[URGENT] LiterView capture drain FAILED" \
+            --body "drain.yml failed, so captured papers are not reaching the corpus. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

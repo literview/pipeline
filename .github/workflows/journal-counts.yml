@@ -1,0 +1,67 @@
+name: Resync journal paper counts
+
+# LiterView ledger task journal-count-resync (owner decision 2026-10-26). journals.paper_count is kept by
+# the trigger papers_journal_count_trigger (migration 067: a paper counts when it is core and has a
+# journal). Production drifted above that definition through writes the trigger did not see (37 of 386
+# journals, total gap 2,802; corrected once by hand on 2026-10-27 with the backup table
+# journals_paper_count_backup_20261026). pipeline/resync_journal_counts.py (a copy of the LiterView
+# master) recounts every journal and writes back the ones that differ, under LOCK TABLE papers IN SHARE
+# MODE so a concurrent ingest's trigger increment cannot be overwritten; it waits at most 5 s per
+# attempt for the lock, three attempts 30 s apart, and holds it for about one recount (under a second).
+# Papers writes wait while it holds the lock, including the web app's upvote and comment counters.
+#
+# Weekly, Sunday 08:17 UTC (off the drain's :04 and :34 dispatches), and by hand. Corrections in any run
+# after the 2026-10-27 one mean the drift recurred: the step summary says so and lists the journals;
+# there is no other notification for that. A failure (the lock not acquired on any attempt, or a
+# database error) sends the email below; nothing is written in either case.
+#
+# This repository is public: the job prints journal ids, names and counts, which are public data, and
+# never the connection string. The 60-day auto-disable of scheduled workflows in a public repository is
+# covered by gh-cron-watchdog.
+
+on:
+  schedule:
+    - cron: '17 8 * * 0'
+  workflow_dispatch:
+
+concurrency:
+  group: journal-counts
+  cancel-in-progress: false
+
+jobs:
+  resync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-ingest.txt
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-ingest.txt
+
+      - name: Resync journals.paper_count
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        working-directory: pipeline
+        run: python resync_journal_counts.py --apply --summary-md "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify on failure (email)
+        if: failure()
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python3 pipeline/alert_email.py \
+            --title "LiterView journal-counts FAILED" \
+            --body "journal-counts.yml failed, so journals.paper_count was not recounted this week (the lock on papers was not acquired, or the database refused; nothing was written). Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

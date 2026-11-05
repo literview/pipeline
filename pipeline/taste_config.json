@@ -1,0 +1,72 @@
+{
+  "CONFIG_VERSION": "taste-cfg-2",
+  "CONFIG_HASH": "b42ede020ccc25f3f629629b7a3fc38afd4813a14358ddcadefc503176abc6f6",
+  "ENGINE_IDS": {
+    "cardSelector": "card-selector@1",
+    "exampleBuilder": "example-builder@1",
+    "lr": "lr@1",
+    "linearScorer": "linear-scorer@1"
+  },
+  "config": {
+    "embedModelId": "all-MiniLM-L6-v2@256",
+    "cardScreens": 4,
+    "refineScreens": 4,
+    "cardsPerScreen": 3,
+    "seeds": 10,
+    "weights": {
+      "pick": 1,
+      "seed": 0.1,
+      "own": 1,
+      "none": 1,
+      "unpicked": 0,
+      "fewer": 5,
+      "groupLess": 0.5,
+      "groupMore": 2
+    },
+    "exampleChangingKinds": [
+      "card",
+      "seed",
+      "group",
+      "own",
+      "fewer",
+      "hide",
+      "theme"
+    ],
+    "lr": {
+      "C": 0.1,
+      "classBalanced": true,
+      "maxIter": 3000
+    },
+    "negatives": {
+      "count": 1000
+    },
+    "pool": {
+      "perSubfield": 200,
+      "k": 8,
+      "years": [
+        2020,
+        2023
+      ]
+    },
+    "favorite": {
+      "candidateCap": 2000,
+      "pinnedAuthors": 5,
+      "outsideFollows": 5,
+      "randomSlot": {
+        "positions": [
+          3,
+          10
+        ],
+        "fromRanks": [
+          11,
+          200
+        ]
+      }
+    },
+    "cardSelector": {
+      "perClusterCap": 3,
+      "nearNeighbours": 12,
+      "tieBreak": "lowest-paper-id"
+    }
+  }
+}

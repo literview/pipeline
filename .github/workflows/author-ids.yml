@@ -1,0 +1,140 @@
+name: arXiv author IDs
+
+# LiterView daily author-ID pass (ledger task arxiv-daily-pass, decision D3(a) of
+# docs/tierb/ARXIV_AUTHOR_ID_BACKFILL_WORKORDER.md section 11). The one-shot backfill of
+# 2026-09-17 wrote OpenAlex author IDs into the author elements of every arXiv paper older than
+# 14 days. About 250 arXiv papers arrive names-only every day and OpenAlex indexes them two to
+# six days later, so this job runs the same script over the 14-to-60-day window: each day's
+# papers are looked up once OpenAlex holds them, and the ones OpenAlex has no work for are
+# retried every day until they age out of the window. It is stateless -- the checkpoint below is
+# per run, and the selection excludes papers whose elements already carry IDs.
+#
+# 00:20 UTC, after OpenAlex's daily budget resets at 00:00 UTC. The lookups are singleton
+# /works/doi: calls, which OpenAlex charges 0 credits for; a run is a few hundred of them.
+#
+# The concurrency group is this workflow's own, not shared with ingest.yml or drain.yml: those
+# write papers this job reads, and their crawl must not queue behind it, while a second copy of
+# this job would look the same papers up twice. cancel-in-progress is false because cancelling
+# mid-transaction is worse than queueing behind the running copy.
+#
+# pipeline/identity_gates.py runs before and after. The "after" run fails the job on G1, G2 or a
+# resolver-error row added since the timestamp the "before" run recorded; the provisional counts,
+# the conflicts by kind and the leak detector (keyed author rows left holding no link) are
+# reported into the log.
+#
+# This repository is public, so the logs print DOIs, arXiv ids and counts only -- never a
+# connection string, which neither script prints. The 60-day auto-disable of scheduled workflows
+# in a public repository is covered by gh-cron-watchdog.
+
+on:
+  schedule:
+    - cron: '20 0 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: author-ids
+  cancel-in-progress: false
+
+jobs:
+  author-ids:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-ingest.txt
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-ingest.txt
+
+      # The secret is the production pooler. The backfill's guarded UPDATEs fire a trigger per
+      # paper and the gates scan every paper's elements, so both go to the direct endpoint, the
+      # way pipeline/apply_049_prod.py rewrites the host. The rewritten string is masked because
+      # GitHub masks the secret it was derived from, not this value.
+      - name: Point DATABASE_URL at the direct endpoint
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          DIRECT="${DATABASE_URL/-pooler./.}"
+          echo "::add-mask::$DIRECT"
+          echo "DATABASE_URL=$DIRECT" >> "$GITHUB_ENV"
+
+      # The baseline: rows added from this timestamp on are the run's own, and the "after" run
+      # counts resolver-error rows against it.
+      - name: Identity gates before
+        working-directory: pipeline
+        run: |
+          python identity_gates.py --json logs/gates-before.json
+          python -c "import json; print('SINCE=' + json.load(open('logs/gates-before.json'))['now'])" >> "$GITHUB_ENV"
+
+      - name: Backfill the author IDs
+        env:
+          OPENALEX_EMAIL: ${{ secrets.OPENALEX_EMAIL }}
+        working-directory: pipeline
+        run: |
+          python backfill_arxiv_author_ids.py --commit --prod \
+            --min-age-days 14 --max-age-days 60 --batch-size 50 \
+            --json logs/author-ids.json \
+            --age-at-found-log logs/age-at-found.jsonl \
+            --checkpoint logs/author-ids-checkpoint.jsonl
+
+      # always(): a backfill that stopped part way still wrote the batches it committed, so the
+      # gates have to see the database either way. A failing gate fails the job on its own.
+      - name: Identity gates after
+        if: always()
+        working-directory: pipeline
+        run: python identity_gates.py --since "$SINCE" --json logs/gates-after.json
+
+      # The run's counts, and the age-at-found histogram. The log files do not outlive the
+      # runner, so the histogram is printed here: a month of these runs is what decides whether
+      # the 14-day floor can come down (work order section 11, D3).
+      - name: Summary
+        if: always()
+        continue-on-error: true
+        working-directory: pipeline
+        run: |
+          python - <<'PY'
+          import json, pathlib
+          r = json.loads(pathlib.Path("logs/author-ids.json").read_text(encoding="utf-8"))
+          print("selected", r["selected"], "of", r["eligible"], "eligible;", r["batches"], "batches")
+          print("outcomes", {k: v for k, v in r["outcomes"].items() if v})
+          print("positions", {k: v for k, v in r["positions"].items() if v})
+          print("requests", r["requests"], "credits", r["credits"], "cache hits", r["cache_hits"],
+                "wall", r["wall_s"], "s; stopped:", r["stopped"])
+          print("database", {k: v for k, v in r["db"].items()
+                             if k not in ("before", "after") and v not in (0, {}, [])})
+          log = pathlib.Path("logs/age-at-found.jsonl")
+          rows = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines() if x.strip()] if log.exists() else []
+          hist = {}
+          for row in rows:
+              hist[row["age_days"]] = hist.get(row["age_days"], 0) + 1
+          print("age at found, found works by age in days:", dict(sorted(hist.items())))
+          upd = {}
+          for row in rows:
+              if row["outcome"] == "updated":
+                  upd[row["age_days"]] = upd.get(row["age_days"], 0) + 1
+          print("age at found, of those updated:", dict(sorted(upd.items())))
+          PY
+
+      # The same failure step the other workflows use (ingest.yml's header calls it the ntfy
+      # step; alerts moved off ntfy to e-mail on 2026-08-19, LESSONS L015, and this follows the
+      # live code).
+      - name: Notify on failure (email)
+        if: failure()
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python3 pipeline/alert_email.py \
+            --title "[URGENT] LiterView author-ID pass FAILED" \
+            --body "author-ids.yml failed, so new arXiv papers are keeping name-only authors, or an identity gate (G1, G2, resolver-error) did not pass. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

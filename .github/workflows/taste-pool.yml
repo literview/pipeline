@@ -1,0 +1,64 @@
+name: Taste Pool
+
+# LiterView ledger task taste-pipeline (docs/ONBOARDING_TASTE_TEST_DESIGN.md Section 7): the weekly
+# card pool (taste_cards with clusters and neighbours, version pool-<UTC date>) and the monthly
+# negatives version (taste_negatives, version neg-<UTC year-month>; the first run in a month builds
+# it, the rest find it and exit 0). Both builders read pipeline/taste_config.json, embed any member
+# without a vector first, and print a notice and exit 0 while migration 060's tables are absent.
+
+on:
+  schedule:
+    - cron: '0 7 * * 1'
+  workflow_dispatch:
+
+# Its own group: the builders read paper_embeddings, which classify.yml writes, and neither has to
+# wait for the other; a second copy of this job would find the version it is building half-done.
+concurrency:
+  group: taste-pool
+  cancel-in-progress: false
+
+jobs:
+  taste-pool:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-classify.txt
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          # CPU-only torch first, as in classify.yml (LESSONS.md L012).
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-classify.txt
+
+      - name: Build the negatives version (monthly)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        working-directory: pipeline
+        run: python build_taste_negatives.py
+
+      - name: Build the card pool (weekly)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        working-directory: pipeline
+        run: python build_taste_pool.py
+
+      - name: Notify on failure (email)
+        if: failure()
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python3 pipeline/alert_email.py \
+            --title "[URGENT] LiterView taste pool job FAILED" \
+            --body "taste-pool.yml failed (negatives version or card pool build). Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

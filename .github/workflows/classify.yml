@@ -1,0 +1,155 @@
+name: Classify Papers
+
+on:
+  schedule:
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: 'Max papers to classify'
+        required: false
+        default: ''
+        type: string
+      embed_limit:
+        description: 'Max papers to embed for the taste profile (default 5000; the backfill chunk)'
+        required: false
+        default: ''
+        type: string
+
+# One classify run at a time: a backfill dispatch queues behind the daily run (and vice versa)
+# instead of embedding the same newest papers twice. cancel-in-progress is false because
+# cancelling mid-batch is worse than queueing.
+concurrency:
+  group: classify
+  cancel-in-progress: false
+
+jobs:
+  classify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-classify.txt
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          # CPU-only torch, installed FIRST so sentence-transformers reuses it.
+          # The default PyPI torch wheel bundles CUDA + nvidia-* deps and made this
+          # pip cache 8 GiB (280 MiB on the CPU index). Two generations of it blew the
+          # 10 GB per-repo cache quota, and the LRU eviction that followed is what
+          # chose the date a dead MODEL_TOKEN became visible — 2026-07-26, eight days
+          # after the model repo changed owner. The runner has no GPU, so the
+          # CUDA payload was never anything but ballast. See LESSONS.md L012.
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-classify.txt
+
+      # The checkpoint lives in the private repo literview/models, which this
+      # repo's default GITHUB_TOKEN cannot read. The token is minted per run by the
+      # 'literview-ops' GitHub App, scoped to that one repo at Contents:read, and
+      # expires in an hour. It replaces MODEL_TOKEN, a fine-grained PAT: those bind to a
+      # resource OWNER and live at most a year, so when the model repo changed
+      # owner on 2026-07-18 the token went blind and every run stayed
+      # green anyway (LESSONS.md L012). App private keys never expire, which removes the
+      # renewal ceremony rather than rescheduling it.
+      - name: Mint model-repo token (GitHub App)
+        id: model_token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ secrets.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: literview
+          repositories: models
+
+      # NO CHECKPOINT CACHE — deliberate (LESSONS.md L012, 2026-08-13).
+      # An actions/cache in front of this download used to skip it whenever the cache
+      # hit, which hid a dead MODEL_TOKEN for 8 days after the 2026-07-18 org transfer
+      # and left every run silently on weaker keyword labels. Measured price of the
+      # cache: it saved 21 s/day (hit 9s vs miss 30s download + 7s save) while holding
+      # 1.36 GiB of the 10 GB repo quota. The release is already durable GitHub-hosted
+      # storage and costs no quota, so the cache stored the same bytes twice and bought
+      # a blind spot. Running the download unconditionally makes this step the monitor
+      # for the credential: if the token ever breaks again, it fails the same day.
+      # Do not reintroduce a cache here.
+
+      - name: Download student checkpoint
+        env:
+          # Installation token from the mint step above. Weights stay private; compute
+          # stays free (this repo is public). Secrets are not exposed to fork PRs.
+          GH_TOKEN: ${{ steps.model_token.outputs.token }}
+        run: |
+          mkdir -p pipeline/student_prod_v2
+          gh release download student-v2 --repo literview/models -D pipeline/student_prod_v2 --clobber
+
+      - name: Classify new papers (student, ModernBERT)
+        id: student
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        working-directory: pipeline
+        run: python classify_student.py --ckpt student_prod_v2 ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
+        continue-on-error: true
+
+      - name: Classify remaining (keyword + embedding fallback for no-abstract)
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        working-directory: pipeline
+        run: python classify_new_papers.py ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
+        continue-on-error: true
+
+      # Taste profile (LiterView ledger task taste-pipeline): embed navigable papers that have no
+      # paper_embeddings row yet, newest first, at most embed_limit (5000 on the schedule). Prints a
+      # notice and exits 0 while migration 060 is absent. A failure warns and never fails the job
+      # (L4): the next run picks up whatever this one left, because the selection is "no row yet".
+      - name: Embed new papers (taste)
+        id: embed
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        working-directory: pipeline
+        run: python embed_new_papers.py --limit ${{ inputs.embed_limit || '5000' }}
+        continue-on-error: true
+
+      - name: Warn if taste embedding failed (email)
+        if: ${{ always() && steps.embed.outcome == 'failure' }}
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python3 pipeline/alert_email.py \
+            --title "LiterView taste embedding step FAILED" \
+            --body "classify.yml: embed_new_papers.py failed, so today's new papers have no taste vector yet; the next run retries them. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      # The student step is continue-on-error so the keyword fallback still runs
+      # if it dies — but a silent student failure means that day's papers get the
+      # weaker keyword labels. Surface it (warning, not a hard page).
+      - name: Warn if student classifier failed (email)
+        if: ${{ always() && steps.student.outcome == 'failure' }}
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python3 pipeline/alert_email.py \
+            --title "LiterView student classifier FELL BACK to keyword" \
+            --body "classify.yml: the student step failed and the keyword/embedding fallback ran instead, so today's labels are the weaker kind. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+
+      - name: Notify on failure (email)
+        if: failure()
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python3 pipeline/alert_email.py \
+            --title "[URGENT] LiterView classify cron FAILED" \
+            --body "classify.yml failed (checkpoint download, DB, or the classifier itself). Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

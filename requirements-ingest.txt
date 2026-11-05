@@ -1,0 +1,8 @@
+# Lightweight deps for ingest CI workflow (no PyTorch/CUDA)
+psycopg2-binary>=2.9.0
+httpx>=0.25.0
+requests>=2.31.0
+python-dateutil>=2.8.0
+feedparser>=6.0.0
+python-dotenv>=1.0.0
+tenacity>=8.2.0
