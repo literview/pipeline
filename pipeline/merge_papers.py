@@ -105,10 +105,23 @@ ORPHANS_BY_DESIGN: set[str] = {"taste_negatives"}
 # task lp3-import-tables (docs/ledger/lp3-import-tables.md): their rows follow the surviving item in
 # passes (4f) to (4i) of `_fold_library_rows`, each guarded by table existence. Before this entry every
 # merge stopped on 058's table.
+#
+# `ink_ops` (docs/library/INK_V0_DESIGN.md section 1, ledger task ink-merge-children) joined before
+# the table exists, so that creating it stops no merge: pass (4j) moves the loser's ink to the winner
+# and the resurrect re-stamp (4r) has an ink arm, both guarded by table existence.
 KNOWN_LIBRARY_CHILDREN: set[str] = {"annotations", "user_paper_files", "reading_state",
                                     "library_collection_items", "library_capture_queue",
                                     "library_server_fetches", "library_import_links",
-                                    "library_item_source_records", "library_item_citekeys"}
+                                    "library_item_source_records", "library_item_citekeys",
+                                    "ink_ops"}
+
+# A re-stamp gives ink rows versions in chunks of at most this many bytes of stored strokes, each
+# chunk at its own counter bump after the statement's own version (INK_V0_DESIGN.md section 1,
+# "Versions written by a re-stamp"): a pull returns one version whole, and one version past Vercel's
+# 4.5 MB response cap would fail every pull of that user. INK_WEIGHT_SQL is the one weight formula;
+# lib/library/item-merge.ts carries the same text, and the revive trigger's ink arm must use it too.
+INK_RESTAMP_CHUNK_BYTES = 2 * 1024 * 1024
+INK_WEIGHT_SQL = "COALESCE(octet_length(added_strokes), 0)"
 
 # FROZEN PROTOCOL CONSTANT — L1 spec §3. A membership row's id is derived, not chosen, so that
 # two offline clients filing the same paper into the same collection converge on ONE row. The
@@ -236,9 +249,46 @@ def pick_page_edits(w_val, l_val, keep):
     return w_val if w_val is not None else l_val
 
 
+def _ink_chunks(rows) -> list[list]:
+    """The re-stamp's chunks: `rows` are `(id, weight)` in re-stamp order; consecutive rows go into
+    one chunk while its weight stays at most INK_RESTAMP_CHUNK_BYTES. One row weighs at most
+    524,288 bytes (the column's CHECK), so every chunk holds at least one row; no rows, no chunk."""
+    chunks: list[list] = []
+    total = 0
+    for rid, weight in rows:
+        if not chunks or total + weight > INK_RESTAMP_CHUNK_BYTES:
+            chunks.append([])
+            total = 0
+        chunks[-1].append(rid)
+        total += weight
+    return chunks
+
+
+def _restamp_ink(cur, user: str, from_item, to_item, max_version: int | None = None) -> tuple[int, int]:
+    """Move the ink rows of `from_item` to `to_item` (the same item for a re-stamp in place) and give
+    them new versions, one counter bump per chunk (`_ink_chunks`). The caller has already bumped the
+    user's counter row, so this transaction holds it before any ink row is touched (the BUMP_SQL lock
+    order), and every writer that stamps ink versions takes that row first; the chunk versions come
+    from each bump's RETURNING, so they stay fresh after any bump a trigger made. `max_version` keeps
+    only rows at or below it (the resurrect arm). Rows keep their `file_id`: ink paints only on the
+    file it was drawn on (OD-4). Returns (rows, chunks)."""
+    sql = (f"SELECT id, {INK_WEIGHT_SQL} FROM ink_ops WHERE library_item_id = %s"
+           + (" AND version <= %s" if max_version is not None else "") + " ORDER BY version, id")
+    cur.execute(sql, [from_item] + ([max_version] if max_version is not None else []))
+    chunks = _ink_chunks(cur.fetchall())
+    moved = 0
+    for ids in chunks:
+        cur.execute(BUMP_SQL, [user])
+        cv = cur.fetchone()[0]
+        cur.execute("UPDATE ink_ops SET library_item_id = %s, version = %s WHERE id = ANY(%s::uuid[])",
+                    [to_item, cv, [str(i) for i in ids]])
+        moved += cur.rowcount
+    return moved, len(chunks)
+
+
 def _merge_library_user(cur, user: str, loser: str, winner: str, *,
                         collections: bool = False, merged_into: bool = False,
-                        page_edits: bool | None = None) -> dict[str, int]:
+                        page_edits: bool | None = None, ink: bool | None = None) -> dict[str, int]:
     """One user's library rows, loser paper -> winner paper. See module header for why this
     cannot use the generic delete-colliding policy.
 
@@ -255,12 +305,12 @@ def _merge_library_user(cur, user: str, loser: str, winner: str, *,
     cur.execute(f"SELECT {cols} FROM library_items WHERE user_id = %s AND paper_id = %s", [user, winner])
     w_row = cur.fetchone()
     return _fold_library_rows(cur, user, l_row, w_row, winner, v, collections=collections,
-                              merged_into=merged_into, page_edits=page_edits)
+                              merged_into=merged_into, page_edits=page_edits, ink=ink)
 
 
 def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None, v: int, *,
                        collections: bool = False, merged_into: bool = False,
-                       page_edits: bool | None = None) -> dict[str, int]:
+                       page_edits: bool | None = None, ink: bool | None = None) -> dict[str, int]:
     """Steps (2)-(4e) of the per-user library merge, on rows the caller has already read AFTER
     taking the user's counter lock (BUMP_SQL). Two callers: `_merge_library_user` (corpus merge —
     loser and winner rows are both paper-backed) and `pipeline/drain_capture_queue.py` (W-E3
@@ -270,7 +320,8 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
     `l_row` / `w_row` are `(id, deleted_at IS NULL, starred, read_status, memo, added_at,
     ext_meta)` tuples (`w_row` may be None); `winner_paper_id` is the `papers.id` the surviving
     row points at; `v` is the already-bumped version. `page_edits` is the 052 capability flag
-    (None = probe it in (4c)). A surviving row that points at a corpus
+    (None = probe it in (4c)); `ink` says whether `ink_ops` exists (None = probe it in case (4)).
+    A surviving row that points at a corpus
     paper never carries `ext_meta` (039: NULL when paper_id is set), so step (3) clears it on the
     re-point and step (4) never copies an external row's `ext_meta` onto the winner. Both are
     no-ops for the corpus merge, whose rows carry `ext_meta = NULL` already."""
@@ -279,7 +330,8 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
            "collection_items_folded": 0, "collection_items_dropped": 0,
            "collection_items_revived": 0, "resurrect_children_restamped": 0,
            "import_links_moved": 0, "source_records_moved": 0, "source_records_dropped": 0,
-           "citekeys_moved": 0, "citekeys_dropped": 0, "server_fetches_moved": 0}
+           "citekeys_moved": 0, "citekeys_dropped": 0, "server_fetches_moved": 0,
+           "ink_moved": 0, "ink_restamped": 0}
     l_id, l_live, l_star, l_read, l_memo, l_added, l_ext = l_row
     w = w_row
 
@@ -398,6 +450,19 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
             cur.execute("DELETE FROM reading_state WHERE user_id = %s AND library_item_id = %s",
                         [user, l_id])
 
+    # (4j) ink_ops (INK_V0_DESIGN.md section 1): the loser's ink rows follow it to the winner item, in
+    # chunks at their own versions above `v` (`_restamp_ink`), never at `v` itself, which may already
+    # carry a push batch's worth of ink. Each row keeps its `file_id`, so ink drawn on the loser's file
+    # paints only on that file, now a non-primary file of the winner after (4b) (OD-4, no carry-over).
+    # This runs after the field-merge UPDATE above on purpose: on a resurrect, that UPDATE fires the
+    # revive trigger, whose ink arm stamps the winner's own ink, and moving the loser's ink before it
+    # would have the trigger stamp the moved rows a second time. Guarded by table existence, so a
+    # database without `ink_ops` (and the crawler's copy of this file before it is updated) is as before.
+    if ink is None:
+        ink = has_table(cur, "public.ink_ops")
+    if ink:
+        out["ink_moved"], _ = _restamp_ink(cur, user, l_id, w_id)
+
     # (4r) THE RESURRECT CASE, versioned-child arm. When the winner row was a tombstone and has
     # just been brought back to life above (`not w_live`), the children that were ALREADY hanging
     # off it are in exactly the hole (4e-0) describes for memberships: every synced client dropped
@@ -423,6 +488,12 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
                     "WHERE user_id = %s AND library_item_id = %s AND version <> %s",
                     [v, user, w_id, v])
         out["resurrect_children_restamped"] += cur.rowcount
+        # Ink arm: chunked like (4j), at versions above `v`. It takes only rows at or below `v`: once
+        # `ink-migration` gives the revive trigger its ink arm, the field-merge UPDATE has already
+        # stamped the winner's ink above `v` and this arm finds nothing, and (4j)'s rows are above `v`
+        # too. No row is ever stamped at `v`, so the bound is exactly "not yet stamped here".
+        if ink:
+            out["ink_restamped"], _ = _restamp_ink(cur, user, w_id, w_id, max_version=v)
 
     # (4e) library_collection_items — numbered (4e) although it runs BEFORE (4d): "(4d)" is the
     # L1 spec's name for the tombstone pass and must not be renumbered under it.
@@ -607,6 +678,7 @@ def merge_library_items(cur, loser: str, winner: str) -> dict[str, int]:
     collections = has_table(cur, "public.library_collection_items")
     merged_into = has_column(cur, "library_items", "merged_into")
     page_edits = has_column(cur, "reading_state", "page_edits")   # 052
+    ink = has_table(cur, "public.ink_ops")                        # ink-migration
 
     cur.execute("SELECT DISTINCT user_id FROM library_items WHERE paper_id = %s ORDER BY user_id",
                 [loser])
@@ -614,7 +686,7 @@ def merge_library_items(cur, loser: str, winner: str) -> dict[str, int]:
     total: dict[str, int] = {"users": len(users)}
     for u in users:
         merged = _merge_library_user(cur, u, loser, winner, collections=collections,
-                                     merged_into=merged_into, page_edits=page_edits)
+                                     merged_into=merged_into, page_edits=page_edits, ink=ink)
         for k, n in merged.items():
             total[k] = total.get(k, 0) + n
     return total
