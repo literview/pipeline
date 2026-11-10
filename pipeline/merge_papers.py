@@ -239,8 +239,9 @@ def collision_keys(cur, table: str) -> list[list[str]]:
 def pick_page_edits(w_val, l_val, keep):
     """Pass (4c)'s choice of `reading_state.page_edits` when both rows exist (052;
     docs/library/READER_PAGE_EDIT_DESIGN.md section 1, "Corpus merge", and L11(b)): the value whose
-    `file_id` is `keep`, the primary file (4b) kept, with the winner's first when both are; else
-    the winner's value; else the loser's. No kept file matches nothing."""
+    `file_id` is `keep`, the kept file K (MERGE-ANNOT-1; the primary file (4b) keeps, or with no
+    primary the oldest live file), with the winner's first when both are; else the winner's value;
+    else the loser's. No kept file matches nothing."""
     def on_keep(val) -> bool:
         return (keep is not None and isinstance(val, dict) and val.get("file_id") is not None
                 and str(val["file_id"]).lower() == str(keep).lower())
@@ -249,6 +250,106 @@ def pick_page_edits(w_val, l_val, keep):
     if on_keep(l_val):
         return l_val
     return w_val if w_val is not None else l_val
+
+
+# MERGE-ANNOT-1 in the unattended merge (ledger task merge-annot-pipeline): an annotation of the
+# merged-away item made on the same PDF as K, the file the kept item shows after the merge, is
+# re-stamped to K, as the duplicates page does (lib/library/merge-annot.ts). The duplicates page
+# discards the others after a counted warning; no warning can be shown here, so they move to the
+# kept item unchanged. The functions below port that file's planner and take its input shape, so
+# its vectors (lib/library/merge-annot.vectors.json) test both: a file is a dict with id, itemId,
+# md5, sizeBytes, isPrimary, addedAt (UTC microsecond text, so string order is time order) and
+# live; a bucket is a dict with itemId and fileId (None for file_id null). Ids compare lowercased.
+
+def same_pdf(a, b) -> bool:
+    """Whether two file rows hold the same PDF: false when either is unknown; true for the same row;
+    otherwise both carry an md5 and a size, the md5 values equal ignoring case and the sizes equal."""
+    if not a or not b:
+        return False
+    if str(a["id"]).lower() == str(b["id"]).lower():
+        return True
+    if a["md5"] is None or b["md5"] is None or a["sizeBytes"] is None or b["sizeBytes"] is None:
+        return False
+    return a["md5"].lower() == b["md5"].lower() and int(a["sizeBytes"]) == int(b["sizeBytes"])
+
+
+def _lc(s) -> str:
+    return str(s).lower()
+
+
+def shown_file(item_id, files):
+    """The file an item shows: its live files, primary first, then the oldest, then the lower id."""
+    live = [f for f in files if f["live"] and _lc(f["itemId"]) == _lc(item_id)]
+    live.sort(key=lambda f: (not f["isPrimary"], f["addedAt"], _lc(f["id"])))
+    return live[0] if live else None
+
+
+def _newest_primary(item_id, files):
+    """An item's newest live primary, ties to the lower id: the row pass (4b) keeps."""
+    prim = [f for f in files if f["live"] and f["isPrimary"] and _lc(f["itemId"]) == _lc(item_id)]
+    prim.sort(key=lambda f: _lc(f["id"]))
+    prim.sort(key=lambda f: f["addedAt"], reverse=True)   # stable: equal addedAt keeps the lower id first
+    return prim[0] if prim else None
+
+
+def kept_file(keep_id, other_ids, files):
+    """K, from the members' files before any write: the kept item's newest live primary; else the
+    newest live primary of the first other item in fold order that holds one; else the oldest live
+    file of all members (addedAt, then id); None when no member holds a live file."""
+    k = _newest_primary(keep_id, files)
+    if k is not None:
+        return k
+    for other in other_ids:
+        k = _newest_primary(other, files)
+        if k is not None:
+            return k
+    members = {_lc(i) for i in [keep_id, *other_ids]}
+    live = [f for f in files if f["live"] and _lc(f["itemId"]) in members]
+    live.sort(key=lambda f: (f["addedAt"], _lc(f["id"])))
+    return live[0] if live else None
+
+
+def plan_annotations(keep_id, other_ids, files, buckets) -> dict:
+    """The kept file and the same-PDF classification of the other items' buckets: a bucket's PDF is
+    the row its fileId names (any item, live or tombstoned), or for fileId None the file its item
+    showed before the merge; `keep` when that PDF is K's, else `discard` (here: moved unchanged).
+    The kept item's buckets are not classified. `sameFileIds` lists every row of `files` holding K's
+    PDF, K included, in input order."""
+    k = kept_file(keep_id, other_ids, files)
+    by_id = {_lc(f["id"]): f for f in files}
+    others = {_lc(i) for i in other_ids}
+    keep, discard = [], []
+    for b in buckets:
+        if _lc(b["itemId"]) not in others:
+            continue
+        pdf = shown_file(b["itemId"], files) if b["fileId"] is None else by_id.get(_lc(b["fileId"]))
+        (keep if k is not None and same_pdf(pdf, k) else discard).append(
+            {"itemId": b["itemId"], "fileId": b["fileId"]})
+    return {"keptFileId": k["id"] if k else None,
+            "sameFileIds": [] if k is None else [f["id"] for f in files if same_pdf(f, k)],
+            "keep": keep, "discard": discard}
+
+
+def restamp_page_edits(value, same_file_ids, kept_file_id):
+    """A page_edits value of the merged-away item whose file_id names a file holding K's PDF, as a
+    copy re-stamped to K; anything else, or K None, is returned as it is (the same object)."""
+    if kept_file_id is None or not isinstance(value, dict):
+        return value
+    fid = value.get("file_id")
+    if not isinstance(fid, str) or _lc(fid) not in {_lc(i) for i in same_file_ids}:
+        return value
+    return {**value, "file_id": kept_file_id}
+
+
+# The planner's file input for a fold: every file row of the two items, live or tombstoned, and every
+# row one of their live annotations names, user-scoped, in the shape `plan_annotations` takes.
+PLAN_FILE_KEYS = ("id", "itemId", "md5", "sizeBytes", "isPrimary", "addedAt", "live")
+PLAN_FILES_SQL = (
+    "SELECT id::text, library_item_id::text, md5, size_bytes, is_primary, "
+    "to_char(added_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US'), deleted_at IS NULL "
+    "FROM user_paper_files WHERE user_id = %s AND (library_item_id = ANY(%s::uuid[]) "
+    "OR id IN (SELECT file_id FROM annotations WHERE user_id = %s AND library_item_id = ANY(%s::uuid[]) "
+    "AND deleted_at IS NULL))")
 
 
 def _ink_chunks(rows) -> list[list]:
@@ -334,7 +435,7 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
            "collection_items_revived": 0, "resurrect_children_restamped": 0,
            "import_links_moved": 0, "source_records_moved": 0, "source_records_dropped": 0,
            "citekeys_moved": 0, "citekeys_dropped": 0, "server_fetches_moved": 0,
-           "ink_moved": 0, "ink_restamped": 0}
+           "ink_moved": 0, "ink_restamped": 0, "annotations_kept": 0, "kept_file_mismatch": 0}
     l_id, l_live, l_star, l_read, l_memo, l_added, l_ext = l_row
     w = w_row
 
@@ -381,10 +482,30 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
                     WHERE id = %s""", [star, read, memo, ext, added, v, w_id])
     out["field_merged"] += 1
 
-    # (4a) annotations: no unique key on library_item_id, so a plain re-point cannot collide.
+    # MERGE-ANNOT-1: K and the loser's same-PDF annotations, planned from the rows as they are
+    # before any annotation or file moves (the counter lock taken above keeps them so).
+    items = [str(w_id), str(l_id)]
+    cur.execute(PLAN_FILES_SQL, [user, items, user, items])
+    plan_files = [dict(zip(PLAN_FILE_KEYS, r)) for r in cur.fetchall()]
+    cur.execute("SELECT DISTINCT file_id::text FROM annotations "
+                "WHERE user_id = %s AND library_item_id = %s AND deleted_at IS NULL", [user, l_id])
+    plan = plan_annotations(str(w_id), [str(l_id)], plan_files,
+                            [{"itemId": str(l_id), "fileId": r[0]} for r in cur.fetchall()])
+    k = plan["keptFileId"]
+
+    # (4a) annotations: no unique key on library_item_id, so a plain re-point cannot collide. The
+    # loser's live rows made on K's PDF are re-stamped to K first (MERGE-ANNOT-1); every other row,
+    # tombstoned ones included, moves with its file_id unchanged, since no warning can be shown here.
+    if plan["keep"]:
+        cur.execute("UPDATE annotations SET library_item_id = %s, file_id = %s::uuid, version = %s, "
+                    "updated_at = now() WHERE library_item_id = %s AND deleted_at IS NULL "
+                    "AND (file_id = ANY(%s::uuid[]) OR (file_id IS NULL AND %s))",
+                    [w_id, k, v, l_id, [b["fileId"] for b in plan["keep"] if b["fileId"] is not None],
+                     any(b["fileId"] is None for b in plan["keep"])])
+        out["annotations_kept"] = cur.rowcount
     cur.execute("UPDATE annotations SET library_item_id = %s, version = %s, updated_at = now() "
                 "WHERE library_item_id = %s", [w_id, v, l_id])
-    out["annotations_moved"] = cur.rowcount
+    out["annotations_moved"] = out["annotations_kept"] + cur.rowcount
 
     # (4b) user_paper_files: UNIQUE is (user_id, provider, provider_file_id) — untouched by the
     # re-point, so no collision. But both items may carry a live is_primary file; the winner's
@@ -406,6 +527,10 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
         cur.execute("UPDATE user_paper_files SET is_primary = false, version = %s "
                     "WHERE library_item_id = %s AND deleted_at IS NULL AND is_primary AND id <> %s",
                     [v, w_id, keep])
+        # The planner's K must be the primary kept here; a mismatch only counts (the re-stamped rows
+        # still show on whichever file is open), since raising would stop an unattended merge.
+        if k is None or str(keep).lower() != k.lower():
+            out["kept_file_mismatch"] += 1
 
     # (4c) reading_state: PK (user_id, library_item_id) DOES collide. Most-recently-updated wins
     # — NOT the furthest page: a user who restarted the paper on the winner copy must not have
@@ -417,10 +542,11 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
     # the parent item's tombstone (orphan sweep).
     #
     # page_edits (052): its own UPDATE, run whenever both rows exist and independent of the
-    # position comparison, before the loser row is deleted. It keeps the value whose file_id is the
-    # primary file (4b) kept, else the winner's, else the loser's (`pick_page_edits`). Guarded by
-    # has_column so a merge before 052 is applied still runs; probed here when the caller did not
-    # (drain_capture_queue.py calls this function without the flag).
+    # position comparison, before the loser row is deleted. The loser's value is first re-stamped to
+    # K when it names a file holding K's PDF (MERGE-ANNOT-1, `restamp_page_edits`), whether the row
+    # moves or is picked from; then the value whose file_id is K wins, else the winner's, else the
+    # loser's (`pick_page_edits`). Guarded by has_column so a merge before 052 is applied still runs;
+    # probed here when the caller did not (drain_capture_queue.py calls this function without the flag).
     if page_edits is None:
         page_edits = has_column(cur, "reading_state", "page_edits")
     rs_cols = "page, scroll_frac, updated_at" + (", page_edits" if page_edits else "")
@@ -428,12 +554,20 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
                 "WHERE user_id = %s AND library_item_id = %s", [user, l_id])
     rl = cur.fetchone()
     if rl:
+        l_edits = rl[3] if page_edits else None
+        l_restamped = restamp_page_edits(l_edits, plan["sameFileIds"], k)
         cur.execute(f"SELECT {rs_cols} FROM reading_state WHERE user_id = %s AND library_item_id = %s",
                     [user, w_id])
         rw = cur.fetchone()
         if rw is None:
-            cur.execute("UPDATE reading_state SET library_item_id = %s, version = %s "
-                        "WHERE user_id = %s AND library_item_id = %s", [w_id, v, user, l_id])
+            if l_restamped is not l_edits:
+                # `version` only, never `updated_at`, as below.
+                cur.execute("UPDATE reading_state SET library_item_id = %s, version = %s, page_edits = %s::jsonb "
+                            "WHERE user_id = %s AND library_item_id = %s",
+                            [w_id, v, json.dumps(l_restamped), user, l_id])
+            else:
+                cur.execute("UPDATE reading_state SET library_item_id = %s, version = %s "
+                            "WHERE user_id = %s AND library_item_id = %s", [w_id, v, user, l_id])
             out["reading_state_moved"] = 1
         else:
             # loser copy is the fresher read, and a real position
@@ -446,7 +580,7 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
             if page_edits:
                 # `version` only, never `updated_at`: the (4r) reason, and updated_at is what the
                 # position comparison above reads.
-                pick = pick_page_edits(rw[3], rl[3], keep)
+                pick = pick_page_edits(rw[3], l_restamped, k)
                 cur.execute("UPDATE reading_state SET page_edits = %s::jsonb, version = %s "
                             "WHERE user_id = %s AND library_item_id = %s",
                             [None if pick is None else json.dumps(pick), v, user, w_id])
