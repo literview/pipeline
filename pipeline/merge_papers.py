@@ -115,13 +115,15 @@ KNOWN_LIBRARY_CHILDREN: set[str] = {"annotations", "user_paper_files", "reading_
                                     "library_item_source_records", "library_item_citekeys",
                                     "ink_ops"}
 
-# A re-stamp gives ink rows versions in chunks of at most this many bytes of stored strokes, each
+# A re-stamp gives ink rows versions in chunks of at most this much ink weight (OD-8), each
 # chunk at its own counter bump after the statement's own version (INK_V0_DESIGN.md section 1,
 # "Versions written by a re-stamp"): a pull returns one version whole, and one version past Vercel's
-# 4.5 MB response cap would fail every pull of that user. INK_WEIGHT_SQL is the one weight formula;
-# lib/library/item-merge.ts carries the same text, and the revive trigger's ink arm must use it too.
+# 4.5 MB response cap would fail every pull of that user. INK_WEIGHT_SQL is the one weight formula
+# (OD-8, owner 2026-11-10: the bytes of added_strokes plus 38 per erased id, INK_V0_DESIGN.md
+# section 8); lib/library/item-merge.ts carries the same text, and the revive trigger's ink arm must
+# use it too.
 INK_RESTAMP_CHUNK_BYTES = 2 * 1024 * 1024
-INK_WEIGHT_SQL = "COALESCE(octet_length(added_strokes), 0)"
+INK_WEIGHT_SQL = "COALESCE(octet_length(added_strokes), 0) + 38 * COALESCE(cardinality(erased_ids), 0)"
 
 # FROZEN PROTOCOL CONSTANT — L1 spec §3. A membership row's id is derived, not chosen, so that
 # two offline clients filing the same paper into the same collection converge on ONE row. The
@@ -252,7 +254,8 @@ def pick_page_edits(w_val, l_val, keep):
 def _ink_chunks(rows) -> list[list]:
     """The re-stamp's chunks: `rows` are `(id, weight)` in re-stamp order; consecutive rows go into
     one chunk while its weight stays at most INK_RESTAMP_CHUNK_BYTES. One row weighs at most
-    524,288 bytes (the column's CHECK), so every chunk holds at least one row; no rows, no chunk."""
+    524,288 + 38 x 10,000 = 904,288 (the two columns' CHECKs, OD-8), under 2 MiB, so every chunk
+    holds at least one row; no rows, no chunk."""
     chunks: list[list] = []
     total = 0
     for rid, weight in rows:
