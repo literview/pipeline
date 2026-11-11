@@ -25,6 +25,7 @@ import httpx
 sys.path.insert(0, str(Path(__file__).parent))
 
 from db import get_client, execute, execute_write, upsert_paper, link_paper_to_discipline, get_disciplines_map
+from ingest_journals import link_slugs_for
 from journals_config import JOURNAL_ISSNS, JOURNALS_BY_DISCIPLINE
 from text_norm import is_truncated_preview
 from ingest_work import biblio_from_crossref  # volume, issue, pages (migration 068)
@@ -235,14 +236,14 @@ def normalize_crossref_paper(item: dict, journal_name: str) -> dict | None:
     }
 
 
-def get_discipline_for_journal(journal_name: str) -> str | None:
-    """Find the discipline for a journal name."""
+def get_disciplines_for_journal(journal_name: str) -> list[str]:
+    """The disciplines a journal's papers link to: the slugs whose lists hold this name (case-insensitive), in config
+    order, through link_slugs_for (ingest-multi-discipline-link: a journal on both the Politics and the Policy lists
+    gives both; any other journal its first listed discipline, as before)."""
     journal_lower = journal_name.lower()
-    for discipline, journals in JOURNALS_BY_DISCIPLINE.items():
-        for source_id, name in journals.items():
-            if name.lower() == journal_lower:
-                return discipline
-    return None
+    listed = [discipline for discipline, journals in JOURNALS_BY_DISCIPLINE.items()
+              if any(name.lower() == journal_lower for name in journals.values())]
+    return link_slugs_for(listed)
 
 
 def main():
@@ -282,13 +283,13 @@ def main():
         for journal_name, issn in JOURNAL_ISSNS.items():
             if not issn:
                 continue
-            discipline = get_discipline_for_journal(journal_name)
-            if args.discipline and discipline != args.discipline:
+            disciplines = get_disciplines_for_journal(journal_name)
+            if args.discipline and args.discipline not in disciplines:
                 continue
             journals_to_fetch.append({
                 "name": journal_name,
                 "issn": issn,
-                "discipline": discipline
+                "disciplines": disciplines
             })
 
         print(f"Processing {len(journals_to_fetch)} journals with ISSNs")
@@ -306,9 +307,9 @@ def main():
         for journal in journals_to_fetch:
             journal_name = journal["name"]
             issn = journal["issn"]
-            discipline = journal["discipline"]
+            disciplines = journal["disciplines"]
 
-            print(f"\n[{discipline or 'unknown'}] {journal_name} (ISSN: {issn})...")
+            print(f"\n[{'+'.join(disciplines) or 'unknown'}] {journal_name} (ISSN: {issn})...")
 
             works = fetch_crossref_works(issn, from_date, args.per_page)
             stats["journals_processed"] += 1
@@ -346,9 +347,10 @@ def main():
                         stats["papers_inserted"] += 1
                         existing_dois.add(normalized_doi)  # Add to set to prevent duplicates in same run
 
-                        # Link to discipline
-                        if discipline and discipline in disciplines_map:
-                            link_paper_to_discipline(conn, result, disciplines_map[discipline], source="crossref")
+                        # Link to each of the journal's disciplines
+                        for discipline in disciplines:
+                            if discipline in disciplines_map:
+                                link_paper_to_discipline(conn, result, disciplines_map[discipline], source="crossref")
                 except Exception as e:
                     print(f"    Error inserting paper: {e}")
 

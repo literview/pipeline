@@ -26,6 +26,20 @@ load_dotenv()  # fallback for .env
 
 OPENALEX_EMAIL = os.environ.get("OPENALEX_EMAIL", "")
 
+# Disciplines whose shared journals link a paper to every one of them (ledger task ingest-multi-discipline-link, owner
+# "가" 2026-11-09): a journal listed under both political science and public policy gives its papers both links. A
+# journal on any other pair of lists (Administrative Science Quarterly, the three finance journals) keeps its first
+# listed discipline until a primary-discipline rule is decided.
+MULTI_LINK_SLUGS = frozenset({"political-science", "public-policy"})
+
+
+def link_slugs_for(slugs: list[str]) -> list[str]:
+    """The disciplines a journal's papers link to, from its listed slugs in config order: every slug when all of them are
+    in MULTI_LINK_SLUGS, otherwise the first only. Journal ingest, Crossref ingest and the backfill all call this."""
+    if slugs and all(s in MULTI_LINK_SLUGS for s in slugs):
+        return list(slugs)
+    return list(slugs[:1])
+
 
 def trigger_revalidation(saved: int) -> None:
     """Bust the ISR cache for feed pages that depend on newly-ingested papers.
@@ -123,7 +137,11 @@ def fetch_papers_by_sources(
 
 
 def save_papers(client, papers: list[dict], historical: bool) -> tuple[int, int]:
-    """Upsert each paper and link it to its discipline; returns (saved, linked).
+    """Upsert each paper and link it to each of its disciplines; returns (saved, linked), `linked` counting links.
+
+    A paper carries `_discipline_ids` (main(), ingest-multi-discipline-link) or the older single `_discipline_id`
+    (`_discipline_slug` beside it); all three keys are popped before the upsert, because upsert_paper writes every key it
+    is given and an underscore key would fail the write inside this function's swallowed except.
 
     A paper that a --from/--to/--year run inserts is a deliberate past collection, origin
     'backfill' (owner decision O4, DECISIONS 2026-09-17), which papers_set_use_date() dates by
@@ -136,16 +154,19 @@ def save_papers(client, papers: list[dict], historical: bool) -> tuple[int, int]
     linked = 0
     for paper in papers:
         try:
-            discipline_id = paper.pop("_discipline_id")
-            discipline_slug = paper.pop("_discipline_slug")
+            ids = paper.pop("_discipline_ids", None)
+            one = paper.pop("_discipline_id", None)
+            paper.pop("_discipline_slug", None)
+            ids = ids or [one]
 
             if historical and db_match(client, paper) is None:
                 paper["origin"] = "backfill"
             paper_id, _inserted = upsert_paper(client, paper)
             if paper_id:
                 saved += 1
-                link_paper_to_discipline(client, paper_id, discipline_id, source="journal")
-                linked += 1
+                for discipline_id in ids:
+                    link_paper_to_discipline(client, paper_id, discipline_id, source="journal")
+                    linked += 1
 
         except Exception as e:
             print(f"[Ingest] Error saving paper: {e}")
@@ -182,11 +203,18 @@ def main(
     disciplines_map = get_disciplines_map(client)
     print(f"[Ingest] Loaded {len(disciplines_map)} disciplines from DB")
 
-    # Build reverse map: OpenAlex source URL -> config journal name
+    # Build reverse maps: OpenAlex source URL -> config journal name, and -> the disciplines its papers link to
+    # (link_slugs_for over the source's listed slugs in config order, only slugs present in the database)
     source_id_to_name = {}
+    listed_slugs: dict[str, list[str]] = {}
     for disc, journals in JOURNALS_BY_DISCIPLINE.items():
         for src_id, name in journals.items():
-            source_id_to_name[f"https://openalex.org/{src_id}"] = name
+            url = f"https://openalex.org/{src_id}"
+            source_id_to_name[url] = name
+            if disc in disciplines_map:
+                listed_slugs.setdefault(url, []).append(disc)
+    source_id_to_slugs = {url: link_slugs_for(slugs) for url, slugs in listed_slugs.items()}
+    absent = 0
 
     all_papers = []
     seen_ids = set()
@@ -213,8 +241,15 @@ def main(
                     src_oa_id = paper.pop("source_openalex_id", None)
                     if src_oa_id and src_oa_id in source_id_to_name:
                         paper["source"] = source_id_to_name[src_oa_id]
-                    paper["_discipline_id"] = discipline_id
-                    paper["_discipline_slug"] = discipline_slug
+                    # the source's disciplines (a paper of a journal on both the Politics and the Policy lists links to
+                    # both, whichever discipline's query returned it first); a source absent from the map links to the
+                    # discipline that fetched it
+                    slugs = source_id_to_slugs.get(src_oa_id) if src_oa_id else None
+                    if slugs:
+                        paper["_discipline_ids"] = [disciplines_map[s] for s in slugs]
+                    else:
+                        paper["_discipline_ids"] = [discipline_id]
+                        absent += 1
                     all_papers.append(paper)
                     new_count += 1
 
@@ -225,6 +260,7 @@ def main(
             print(f"[{disc_idx}/{len(JOURNALS_BY_DISCIPLINE)}] {discipline_slug}: Error - {e}")
 
     print(f"\n[Ingest] Collected {len(all_papers)} unique papers from {len(JOURNALS_BY_DISCIPLINE)} disciplines")
+    print(f"[Ingest] {absent} papers with a source id absent from the map")
 
     if dry_run:
         print("[Ingest] --dry-run: skipping DB writes")
@@ -235,7 +271,7 @@ def main(
     saved, linked = save_papers(client, all_papers, historical)
 
     print(f"[Ingest] Saved {saved} papers to database")
-    print(f"[Ingest] Linked {linked} papers to disciplines")
+    print(f"[Ingest] Linked {linked} paper-discipline links")
 
     # Only bust the cache when papers were actually written this run.
     if saved > 0:
