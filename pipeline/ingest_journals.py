@@ -5,6 +5,7 @@ Fetches papers from ALL journals in journals_config.py, batched by discipline.
 Each discipline's journals are queried together using OpenAlex OR filter.
 """
 import os
+import sys
 import time
 import httpx
 from datetime import datetime, timedelta
@@ -82,7 +83,35 @@ def trigger_revalidation(saved: int) -> None:
     raise RuntimeError(f"[Revalidate] Giving up after {attempts} attempts: {url}")
 
 
-@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+def _describe(e: BaseException) -> str:
+    """A failure for the log without the request URL: the URL carries the mailto address percent-encoded, which the
+    Actions log of the public crawler repo would not mask."""
+    if isinstance(e, httpx.HTTPStatusError):
+        return f"HTTP {e.response.status_code}"
+    return f"{type(e).__name__}: {e}"
+
+
+class PartialFetchError(Exception):
+    """A page fetch still failed after its retries. `papers` holds the normalized papers of the pages read before it
+    (possibly none), `page` the 1-based number of the failed page, `cause` its last exception. main() keeps the papers
+    and counts the failure (ledger task openalex-loud-failure)."""
+
+    def __init__(self, papers: list[dict], page: int, cause: BaseException):
+        super().__init__(f"page {page} failed after {len(papers)} papers: {_describe(cause)}")
+        self.papers = papers
+        self.page = page
+        self.cause = cause
+
+
+@retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10), reraise=True)
+def _get_page(url: str, params: dict) -> dict:
+    """One OpenAlex page, three attempts. The retry sits here rather than on the whole fetch so that a retry repeats
+    only the failing page and a final failure keeps the pages already read."""
+    response = httpx.get(url, params=params, timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
 def fetch_papers_by_sources(
     source_ids: list[str],
     from_date: str,
@@ -94,6 +123,7 @@ def fetch_papers_by_sources(
     Fetch papers from multiple sources via OpenAlex within [from_date, to_date].
     Uses OR filter to batch all source IDs for a discipline into one query.
     Cursor pagination (OpenAlex page-based capped at 10k).
+    Raises PartialFetchError, carrying the papers already read, when a page still fails after its retries.
     """
     papers = []
     source_filter = "|".join(source_ids)
@@ -115,11 +145,14 @@ def fetch_papers_by_sources(
         params["mailto"] = OPENALEX_EMAIL
 
     cursor = "*"
+    page = 0
     while cursor and len(papers) < max_papers:
         params["cursor"] = cursor
-        response = httpx.get(url, params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+        page += 1
+        try:
+            data = _get_page(url, params)
+        except Exception as e:
+            raise PartialFetchError(papers, page, e) from e
 
         results = data.get("results", [])
         if not results:
@@ -184,6 +217,8 @@ def main(
 
     Either pass (from_date, to_date) for historical backfill, or leave them None
     to use the rolling --days window (default cron behavior).
+
+    Returns the number of disciplines whose fetch failed (0 when none did); the script exits 1 when it is not 0.
     """
     historical = from_date is not None
     if from_date is None:
@@ -218,6 +253,7 @@ def main(
 
     all_papers = []
     seen_ids = set()
+    failed: list[str] = []
 
     for disc_idx, (discipline_slug, journals) in enumerate(JOURNALS_BY_DISCIPLINE.items(), 1):
         discipline_id = disciplines_map.get(discipline_slug)
@@ -230,7 +266,13 @@ def main(
             continue
 
         try:
-            papers = fetch_papers_by_sources(source_ids, from_date=from_date, to_date=to_date, per_page=per_page)
+            try:
+                papers = fetch_papers_by_sources(source_ids, from_date=from_date, to_date=to_date, per_page=per_page)
+            except PartialFetchError as e:
+                failed.append(discipline_slug)
+                papers = e.papers
+                print(f"[{disc_idx}/{len(JOURNALS_BY_DISCIPLINE)}] {discipline_slug}: Error - {e}; "
+                      f"keeping {len(papers)} papers already read")
             new_count = 0
 
             for paper in papers:
@@ -257,6 +299,8 @@ def main(
             time.sleep(0.1)
 
         except Exception as e:
+            if discipline_slug not in failed:
+                failed.append(discipline_slug)
             print(f"[{disc_idx}/{len(JOURNALS_BY_DISCIPLINE)}] {discipline_slug}: Error - {e}")
 
     print(f"\n[Ingest] Collected {len(all_papers)} unique papers from {len(JOURNALS_BY_DISCIPLINE)} disciplines")
@@ -265,7 +309,7 @@ def main(
     if dry_run:
         print("[Ingest] --dry-run: skipping DB writes")
         print(f"[Ingest] Completed at {datetime.now().isoformat()}")
-        return
+        return _report_failures(failed)
 
     # Save to database
     saved, linked = save_papers(client, all_papers, historical)
@@ -278,6 +322,13 @@ def main(
         trigger_revalidation(saved)
 
     print(f"[Ingest] Completed at {datetime.now().isoformat()}")
+    return _report_failures(failed)
+
+
+def _report_failures(failed: list[str]) -> int:
+    if failed:
+        print(f"[Ingest] {len(failed)} discipline(s) failed: {', '.join(failed)}")
+    return len(failed)
 
 
 if __name__ == "__main__":
@@ -299,10 +350,12 @@ if __name__ == "__main__":
         from_date = f"{args.year}-01-01"
         to_date = f"{args.year}-12-31"
 
-    main(
+    failures = main(
         from_date=from_date,
         to_date=to_date,
         days=args.days,
         per_page=args.per_page,
         dry_run=args.dry_run,
     )
+    if failures:
+        sys.exit(1)
