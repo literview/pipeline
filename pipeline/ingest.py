@@ -8,6 +8,7 @@ Fetches papers from multiple sources:
 - Journal RSS feeds
 """
 import os
+import random
 import time
 import httpx
 import feedparser
@@ -565,6 +566,31 @@ def normalize_nber(entry: dict) -> dict | None:
 # arXiv
 # ============================================
 
+def _arxiv_retryable(error: Exception) -> bool:
+    """A failure worth one more try: HTTP 429 or any timeout (ledger task arxiv-retry)."""
+    if isinstance(error, httpx.TimeoutException):
+        return True
+    return isinstance(error, httpx.HTTPStatusError) and error.response.status_code == 429
+
+
+def _get_arxiv_category(url: str, params: dict, cat: str) -> httpx.Response:
+    """GET one category's query; on a 429 or a timeout wait 10 to 20 s and try once more."""
+    try:
+        response = httpx.get(url, params=params, timeout=30)
+        response.raise_for_status()
+        return response
+    except Exception as e:
+        if not _arxiv_retryable(e):
+            raise
+        wait = random.uniform(10, 20)
+        reason = f"HTTP {e.response.status_code}" if isinstance(e, httpx.HTTPStatusError) else f"{type(e).__name__}: {e}"
+        print(f"[arXiv] {cat}: {reason}; retrying once in {wait:.0f} s")
+        time.sleep(wait)
+    response = httpx.get(url, params=params, timeout=30)
+    response.raise_for_status()
+    return response
+
+
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
 def fetch_arxiv(max_results_per_category: int = 50, categories: list[str] | None = None) -> list[dict]:
     """
@@ -592,8 +618,7 @@ def fetch_arxiv(max_results_per_category: int = 50, categories: list[str] | None
         }
 
         try:
-            response = httpx.get(url, params=params, timeout=30)
-            response.raise_for_status()
+            response = _get_arxiv_category(url, params, cat)
 
             # Parse Atom feed
             feed = feedparser.parse(response.text)
