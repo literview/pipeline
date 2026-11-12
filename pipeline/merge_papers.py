@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 import uuid
@@ -222,18 +223,87 @@ def referencing_tables(cur) -> list[str]:
     return [r[0] for r in cur.fetchall() if not _excluded(r[0])]
 
 
-def collision_keys(cur, table: str) -> list[list[str]]:
-    """PK/UNIQUE constraint column-lists that include paper_id — the keys a re-pointed loser
-    row could collide on."""
-    cur.execute("""
-        SELECT array_agg(a.attname ORDER BY k.ord) AS cols
-          FROM pg_constraint con
-          JOIN pg_class rel ON rel.oid = con.conrelid
-          JOIN LATERAL unnest(con.conkey) WITH ORDINALITY AS k(attnum, ord) ON true
-          JOIN pg_attribute a ON a.attrelid = rel.oid AND a.attnum = k.attnum
-         WHERE rel.relname = %s AND con.contype IN ('p', 'u')
-         GROUP BY con.oid""", [table])
-    return [r[0] for r in cur.fetchall() if "paper_id" in r[0]]
+# The unique keys of one table, from pg_index: every unique index that is live and ready (a primary key
+# or UNIQUE constraint has one, and so does a plain CREATE UNIQUE INDEX, which pg_constraint does not
+# list; an index left invalid by a failed concurrent build still raises 23505, so it counts). Per key
+# column, within indnkeyatts (INCLUDE columns do not take part in uniqueness): the term as the catalog
+# prints it, unpretty (a column name, or an expression such as COALESCE(label_id, ''::text)), its
+# attribute number (0 for an expression), whether its operator class is the type's default, the
+# index's collation and the column's (-1 for an expression).
+COLLISION_KEYS_SQL = """
+    SELECT i.relname,
+           ARRAY(SELECT pg_get_indexdef(ix.indexrelid, g, false)
+                   FROM generate_series(1, ix.indnkeyatts::int) g ORDER BY g) AS terms,
+           ARRAY(SELECT ix.indkey[g - 1]::int FROM generate_series(1, ix.indnkeyatts::int) g ORDER BY g) AS attnums,
+           ARRAY(SELECT oc.opcdefault FROM generate_series(1, ix.indnkeyatts::int) g
+                   JOIN pg_opclass oc ON oc.oid = ix.indclass[g - 1] ORDER BY g) AS opc_default,
+           ARRAY(SELECT ix.indcollation[g - 1]::int FROM generate_series(1, ix.indnkeyatts::int) g ORDER BY g) AS idx_coll,
+           ARRAY(SELECT COALESCE((SELECT a.attcollation::int FROM pg_attribute a
+                                   WHERE a.attrelid = ix.indrelid AND a.attnum = ix.indkey[g - 1]), -1)
+                   FROM generate_series(1, ix.indnkeyatts::int) g ORDER BY g) AS col_coll,
+           (SELECT a.attnum::int FROM pg_attribute a
+             WHERE a.attrelid = ix.indrelid AND a.attname = 'paper_id' AND NOT a.attisdropped) AS paper_attnum,
+           pg_get_expr(ix.indpred, ix.indrelid, false) AS pred
+      FROM pg_index ix
+      JOIN pg_class i ON i.oid = ix.indexrelid
+      JOIN pg_class rel ON rel.oid = ix.indrelid
+     WHERE rel.relnamespace = 'public'::regnamespace AND rel.relname = %s
+       AND ix.indisunique AND ix.indislive AND ix.indisready
+     ORDER BY i.relname"""
+
+DEFAULT_COLLATION_OID = 100     # pg_collation "default"; 0 is a type without collation
+_PAPER_ID_WORD = re.compile(r"\bpaper_id\b")
+
+
+def collision_keys(cur, table: str) -> list[dict]:
+    """The keys a re-pointed loser row of `table` could collide on: each unique index (COLLISION_KEYS_SQL)
+    that holds paper_id as a plain key column, as {"index": name, "terms": the other key terms,
+    "pred": a partial index's predicate or None}. Two indexes with the same terms and predicate come
+    back once. An index whose key expression or predicate names paper_id, or the whole row, stops the
+    merge (SystemExit): evaluated on the loser's row before the re-point, such a term has another value
+    than after it. So does a counted index whose equality is not the type's default (a non-default
+    operator class, an index collation other than the column's, a collated expression): the merge
+    compares with IS NOT DISTINCT FROM, which uses the default. Catalog text never comes from a user."""
+    cur.execute(COLLISION_KEYS_SQL, [table])
+    whole_row = re.compile(r"\.\*|\b" + re.escape(table) + r"\b")
+    keys: list[dict] = []
+    seen: set = set()
+    for name, terms, attnums, opc_default, idx_coll, col_coll, paper_attnum, pred in cur.fetchall():
+        texts = [t for t, a in zip(terms, attnums) if a == 0] + ([pred] if pred else [])
+        if any(_PAPER_ID_WORD.search(x) or whole_row.search(x) for x in texts):
+            raise SystemExit(f"[abort] unique index {name} on {table} names paper_id or the whole row inside a "
+                             f"key expression or its predicate; the merge cannot tell whether a re-pointed row "
+                             f"collides there. Give the table a bespoke merge pass first.")
+        if paper_attnum is None or paper_attnum not in attnums:
+            continue          # a key without paper_id cannot be violated by the re-point
+        for term, a, dflt, ic, cc in zip(terms, attnums, opc_default, idx_coll, col_coll):
+            if not dflt or (a != 0 and ic != cc) or (a == 0 and ic not in (0, DEFAULT_COLLATION_OID)):
+                raise SystemExit(f"[abort] unique index {name} on {table}: key term {term} uses a non-default "
+                                 f"operator class or collation, so the merge's IS NOT DISTINCT FROM is not the "
+                                 f"index's equality. Give the table a bespoke merge pass first.")
+        others = [t for t, a in zip(terms, attnums) if a != paper_attnum]
+        sig = (tuple(others), pred)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        keys.append({"index": name, "terms": others, "pred": pred})
+    return keys
+
+
+def collision_delete_sql(table: str, key: dict) -> str:
+    """The statement that deletes the loser's rows of `table` colliding with a winner row on `key`
+    (collision_keys), parameters [loser, loser, winner]. Each derived table reads the table alone, so the
+    catalog's unqualified terms and predicate resolve to that side's row; NULL equals NULL (IS NOT
+    DISTINCT FROM), so a loser row equal to a winner row on the key is dropped as a duplicate even where
+    the index would accept both. `%` in catalog text is doubled for the driver's parameter syntax."""
+    esc = [t.replace("%", "%%") for t in key["terms"]]
+    where = "paper_id = %s" + (f" AND ({key['pred'].replace('%', '%%')})" if key["pred"] else "")
+    cols = ", ".join(f"({t}) AS _k{i}" for i, t in enumerate(esc, 1))
+    on = " AND ".join(f"l._k{i} IS NOT DISTINCT FROM w._k{i}" for i in range(1, len(esc) + 1)) or "true"
+    return (f'DELETE FROM "{table}" WHERE paper_id = %s AND (tableoid, ctid) IN ('
+            f'SELECT l._toid, l._ctid'
+            f' FROM (SELECT tableoid AS _toid, ctid AS _ctid{", " + cols if cols else ""} FROM "{table}" WHERE {where}) l'
+            f' JOIN (SELECT {cols or "1 AS _one"} FROM "{table}" WHERE {where}) w ON {on})')
 
 
 def pick_page_edits(w_val, l_val, keep):
@@ -375,11 +445,16 @@ def _restamp_ink(cur, user: str, from_item, to_item, max_version: int | None = N
     order), and every writer that stamps ink versions takes that row first; the chunk versions come
     from each bump's RETURNING, so they stay fresh after any bump a trigger made. `max_version` keeps
     only rows at or below it (the resurrect arm). Rows keep their `file_id`: ink paints only on the
-    file it was drawn on (OD-4). Returns (rows, chunks)."""
-    sql = (f"SELECT id, {INK_WEIGHT_SQL} FROM ink_ops WHERE library_item_id = %s"
+    file it was drawn on (OD-4). Only `user`'s rows move: a row of another account that names this item
+    (the schema allows it) keeps its item and version, and is counted in a warning. Returns (rows, chunks)."""
+    sql = (f"SELECT id, {INK_WEIGHT_SQL} FROM ink_ops WHERE library_item_id = %s AND user_id = %s"
            + (" AND version <= %s" if max_version is not None else "") + " ORDER BY version, id")
-    cur.execute(sql, [from_item] + ([max_version] if max_version is not None else []))
+    cur.execute(sql, [from_item, user] + ([max_version] if max_version is not None else []))
     chunks = _ink_chunks(cur.fetchall())
+    cur.execute("SELECT count(*) FROM ink_ops WHERE library_item_id = %s AND user_id <> %s", [from_item, user])
+    foreign = cur.fetchone()[0]
+    if foreign:
+        print(f"  [warn] {foreign} ink row(s) of another account name the merged item; left in place")
     moved = 0
     for ids in chunks:
         cur.execute(BUMP_SQL, [user])
@@ -842,6 +917,13 @@ BESPOKE_MERGERS = {"library_items": merge_library_items}
 TASTE_NOT_GENERIC = {"taste_negatives", "taste_cards", "paper_embeddings"}
 
 
+def is_generic(table: str) -> bool:
+    """Whether merge()'s generic pass (collision keys, then the re-point UPDATE) handles `table`. The one
+    test both the up-front key read and the loop use, so a table that leaves BESPOKE_MERGERS has its keys
+    read, and an index of it the pass cannot judge stops the merge (collision_keys)."""
+    return table not in TASTE_NOT_GENERIC and table not in BESPOKE_MERGERS
+
+
 def merge_taste_negatives(cur, loser: str, winner: str) -> dict[str, int]:
     cur.execute("DELETE FROM taste_negatives l WHERE l.paper_id = %s AND EXISTS "
                 "(SELECT 1 FROM taste_negatives w WHERE w.paper_id = %s AND w.version = l.version)",
@@ -912,6 +994,10 @@ def merge(conn, loser: str, winner: str, reason: str | None, dry: bool = False) 
     # no DB-side protection are already consistent.
     ordered = sorted(tables, key=lambda t: (t not in FK_LESS_ALLOWLIST, t))
 
+    # The unique keys of every table the generic pass handles, read before the first write, so that an
+    # index the pass cannot judge (collision_keys) stops the merge here rather than half way.
+    keys = {t: collision_keys(cur, t) for t in ordered if is_generic(t)}
+
     # Taste negatives before the generic pass (contracts v1.2); taste_cards and paper_embeddings
     # are skipped by it (TASTE_NOT_GENERIC).
     if "taste_negatives" in tables:
@@ -920,25 +1006,17 @@ def merge(conn, loser: str, winner: str, reason: str | None, dry: bool = False) 
             stats["taste_negatives"] = s
 
     for t in ordered:
-        if t in TASTE_NOT_GENERIC:
-            continue
         if t in BESPOKE_MERGERS:
             s = BESPOKE_MERGERS[t](cur, loser, winner)
             if any(v for k, v in s.items() if k != "users"):
                 stats[t] = s
             continue
+        if not is_generic(t):
+            continue
         deleted = 0
-        for cols in collision_keys(cur, t):
-            others = [c for c in cols if c != "paper_id"]
-            if others:
-                pred = " AND ".join(f"w.{c} IS NOT DISTINCT FROM l.{c}" for c in others)
-                sql = (f'DELETE FROM "{t}" l WHERE l.paper_id = %s AND EXISTS '
-                       f'(SELECT 1 FROM "{t}" w WHERE w.paper_id = %s AND {pred})')
-                cur.execute(sql, [loser, winner])
-            else:
-                # key is exactly (paper_id): at most one row per paper; winner's row wins
-                cur.execute(f'DELETE FROM "{t}" l WHERE l.paper_id = %s AND EXISTS '
-                            f'(SELECT 1 FROM "{t}" w WHERE w.paper_id = %s)', [loser, winner])
+        for key in keys[t]:
+            # a key of paper_id alone: at most one row per paper, the winner's wins
+            cur.execute(collision_delete_sql(t, key), [loser, loser, winner])
             deleted += cur.rowcount
         cur.execute(f'UPDATE "{t}" SET paper_id = %s WHERE paper_id = %s', [winner, loser])
         moved = cur.rowcount
