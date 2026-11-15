@@ -44,20 +44,40 @@ jobs:
         run: |
           python - <<'PY'
           import os, subprocess, psycopg2
+          from datetime import timedelta
 
-          # Ingest runs every 6h. Alert if the newest paper is older than ~14h
-          # (two missed cycles + scheduling jitter) => ingest is likely down.
-          THRESH_H = 14
+          # Ingest runs every 6h. Only papers the ingest wrote count
+          # (origin = 'pipeline'): a paper a reader saves to their library
+          # (origin = 'user-library') would otherwise reset the clock and hide
+          # a dead ingest. Publishers deposit few new works on Saturday and
+          # Sunday, so hours on those days (UTC) are not counted: from
+          # 2026-09-01 to 2026-11-15 five of the six gaps over 14h fell on a
+          # weekend (longest 20.7h), and the longest gap on the weekday clock
+          # was 14.1h. Alert above 18 weekday hours.
+          THRESH_H = 18
+
+          def weekday_hours(start, end):
+              total, t = 0.0, start
+              while t < end:
+                  nxt = min(end, (t + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0))
+                  if t.weekday() < 5:
+                      total += (nxt - t).total_seconds() / 3600.0
+                  t = nxt
+              return total
 
           conn = psycopg2.connect(os.environ["DATABASE_URL"])
           cur = conn.cursor()
-          cur.execute("SELECT EXTRACT(EPOCH FROM (now() - MAX(created_at)))/3600.0 FROM papers")
-          row = cur.fetchone()
-          hours = row[0] if row and row[0] is not None else None
-          print(f"Hours since newest paper: {hours}")
+          cur.execute("SET TIME ZONE 'UTC'")
+          cur.execute("SELECT (SELECT created_at FROM papers WHERE origin = 'pipeline' "
+                      "ORDER BY created_at DESC LIMIT 1), now()")
+          newest, now = cur.fetchone()
+          hours = weekday_hours(newest, now) if newest is not None else None
+          wall = (now - newest).total_seconds() / 3600.0 if newest is not None else None
+          print(f"Newest pipeline paper: {newest}; weekday hours since: {hours}; wall-clock hours since: {wall}")
 
           if hours is not None and hours > THRESH_H:
-              msg = (f"No new papers in {hours:.1f}h (threshold {THRESH_H}h) - "
+              msg = (f"No new ingest papers in {hours:.1f} weekday hours ({wall:.1f}h wall clock; "
+                     f"threshold {THRESH_H} weekday hours, Saturday and Sunday UTC not counted) - "
                      f"ingest cron may be down or auto-disabled.")
               print("STALE:", msg)
               # One shared sender for the whole estate (pipeline/alert_email.py):
