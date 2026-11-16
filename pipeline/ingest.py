@@ -161,22 +161,10 @@ ARXIV_TO_DISCIPLINE = {
     "quant-ph": "physics",
 }
 
-# All arXiv categories to fetch (main category prefixes)
+# arXiv archives to fetch: only the two that link to a LiterView discipline (decision 2026-11-15, task arxiv-econ-qfin)
 ARXIV_CATEGORIES_TO_FETCH = [
-    "cs",       # Computer Science (40 subcategories)
-    "stat",     # Statistics (6 subcategories)
     "econ",     # Economics (3 subcategories)
     "q-fin",    # Quantitative Finance (9 subcategories)
-    "q-bio",    # Quantitative Biology (10 subcategories)
-    "math",     # Mathematics (32 subcategories)
-    "eess",     # Electrical Engineering (4 subcategories)
-    "physics",  # General Physics
-    "astro-ph", # Astrophysics
-    "cond-mat", # Condensed Matter
-    "quant-ph", # Quantum Physics
-    "hep-th",   # High Energy Physics - Theory
-    "hep-ph",   # High Energy Physics - Phenomenology
-    "gr-qc",    # General Relativity
 ]
 
 
