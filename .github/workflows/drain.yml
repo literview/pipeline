@@ -58,6 +58,7 @@ jobs:
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           OPENALEX_EMAIL: ${{ secrets.OPENALEX_EMAIL }}
+          OPENALEX_API_KEY: ${{ secrets.OPENALEX_API_KEY }}
           SITE_URL: ${{ secrets.SITE_URL }}
           CRON_SECRET: ${{ secrets.CRON_SECRET }}
           VERCEL_PROTECTION_BYPASS: ${{ secrets.VERCEL_PROTECTION_BYPASS }}

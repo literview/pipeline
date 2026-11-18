@@ -65,6 +65,23 @@ ingested, linked or folded exactly as a capture row, with two differences:
     inside the workflow's 20-minute timeout and a capture's dispatch never waits long behind it.
     The run then logs how many import rows are left for the next run.
 
+Title rows (ledger task capture-title-resolve). A pending row with neither a DOI nor an arXiv id (an
+imported record that has a title and an author, or a "+ Add PDF" item after its user checked the
+metadata) is resolved by the title, authors, year and journal its `scraped` carries before the steps
+above: corpus candidates (pg_trgm on the title) first, then OpenAlex (title search). A candidate is
+accepted only when its normalized title equals the row's, every one of {year, first author, venue}
+the row has matches as `lib/library/resolve-title.ts` matches it, and at least two of the three do (a
+field the row lacks never counts); two accepted candidates with different DOIs are no match. The
+accepted DOI then takes the steps above, and the candidate's OpenAlex id, DOI and matched fields are
+stored as `scraped.title_match` first, so a wrong match can be found and undone. A row with no match
+counts an attempt; title rows are retried at most every 24 hours and become `failed` at
+TITLE_MAX_ATTEMPTS. When OpenAlex does not answer 200 (a spent budget, a timeout) the row is only
+stamped, and fails only past FAILED_AFTER_DAYS. A row whose `title_match` an earlier run stored
+reuses it. A title row never writes its item before the link or fold (no card keys, no
+`resolution`): its state lives on the queue row alone, so the item keeps "Edit details" under
+contracts/v1's editable rule, and the item page's save re-enqueues or resets it (main-loop amendment
+2026-11-18 in the spec).
+
 A row whose processing raises (any row): its open transaction is rolled back, but what the row had
 already committed stays (upsert_paper() commits the connection, so an ingested paper and the stored
 `resolved_work` can already be in). The attempt is then recorded in its own transaction:
@@ -93,6 +110,7 @@ import os
 import re
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 import psycopg2
@@ -128,8 +146,14 @@ HTTP_TIMEOUT = 3.0
 # Exponential backoff on a row that resolved nothing: 30 minutes, then an hour, two, four …
 # capped at a day. `attempts` is only incremented by the no-record arm, so a row that is simply
 # waiting for OpenAlex to index the work is retried on a widening schedule rather than every run.
-CLAIM_PREDICATE = ("status = 'pending' AND (last_attempt_at IS NULL OR last_attempt_at < "
-                   "now() - least(interval '24 hours', interval '30 minutes' * power(2, attempts)))")
+# A title row (no DOI, no arXiv id) waits 24 hours between attempts from the first one.
+CLAIM_PREDICATE = ("status = 'pending' AND (last_attempt_at IS NULL OR last_attempt_at < now() - "
+                   "CASE WHEN doi IS NULL AND arxiv_id IS NULL THEN interval '24 hours' "
+                   "ELSE least(interval '24 hours', interval '30 minutes' * power(2, attempts)) END)")
+
+# A title row with no match becomes `failed` at its third attempt (capture-title-resolve).
+TITLE_MAX_ATTEMPTS = 3
+TITLE_CANDIDATES_MAX = 5
 
 # An import row's `scraped.origin`; capture rows carry 'capture', rows written before
 # lp3-import-enqueue carry none (and are capture rows).
@@ -140,7 +164,7 @@ CLAIM_ORDER = "(coalesce(scraped->>'origin', '') = 'import'), created_at"
 
 _CLAIM = (f"SELECT id, library_item_id, user_id, doi, arxiv_id, resolved_work, resolved_source, "
           f"attempts, created_at < now() - interval '{FAILED_AFTER_DAYS} days' AS expired, "
-          f"{IMPORT_ORIGIN} AS is_import "
+          f"{IMPORT_ORIGIN} AS is_import, scraped "
           f"FROM library_capture_queue WHERE {CLAIM_PREDICATE} AND id <> ALL(%s::uuid[]){{only}} "
           f"ORDER BY {CLAIM_ORDER} FOR UPDATE SKIP LOCKED LIMIT 1")
 CLAIM_SQL = _CLAIM.format(only="")
@@ -271,6 +295,261 @@ def parse_arxiv_atom(xml: str) -> dict | None:
         "arxiv_comment": text(arx + "comment"),
     }
     return {k: v for k, v in out.items() if v is not None}
+
+
+# ── title resolution (capture-title-resolve) ─────────────────────────────────
+#
+# The per-field checks are lib/library/resolve-title.ts's (year within one, first author's surname
+# with the first initial when the row has one, a shared venue word of five letters or more), and a
+# field the row has that the candidate fails rejects it there too. Two conditions are added: the
+# normalized titles must be equal (resolve-title.ts's ellipsis-prefix form is not used), and at least
+# two of {year, author, venue} must be present on the row and match.
+
+# Trailing generational suffixes, dropped from both sides before the surname is taken.
+NAME_SUFFIXES = frozenset({"jr", "sr", "ii", "iii", "iv"})
+
+
+def norm_text(s) -> str:
+    """resolve-title.ts `norm`: NFKD, combining marks removed, NFC, lowercase, every run of
+    characters that are not letters or digits one space, trimmed."""
+    s = unicodedata.normalize("NFKD", s if isinstance(s, str) else "")
+    s = "".join(ch for ch in s if not unicodedata.category(ch).startswith("M"))
+    s = unicodedata.normalize("NFC", s).lower()
+    return " ".join("".join(ch if unicodedata.category(ch)[0] in "LN" else " " for ch in s).split())
+
+
+def name_parts(name) -> tuple[str, str]:
+    """(surname, first initial) of one author string, both normalized; the initial is '' for a
+    one-word name. "Family, Given" and "Given Family" both work; a trailing Jr/Sr/II/III/IV is
+    dropped."""
+    if isinstance(name, dict):
+        name = name.get("name")
+    if not isinstance(name, str):
+        return "", ""
+
+    def toks(s: str) -> list[str]:
+        out = [norm_text(t) for t in s.split()]
+        return [t for t in out if t]
+
+    if "," in name:
+        family, given = name.split(",", 1)
+        fam = toks(family)
+        giv = [t for t in toks(given) if t not in NAME_SUFFIXES]
+    else:
+        fam = toks(name)
+        while len(fam) > 1 and fam[-1] in NAME_SUFFIXES:
+            fam.pop()
+        giv = fam[:-1]
+        fam = fam[-1:]
+    while len(fam) > 1 and fam[-1] in NAME_SUFFIXES:
+        fam.pop()
+    surname = fam[-1] if fam else ""
+    return surname, (giv[0][:1] if giv else "")
+
+
+def _int_year(v) -> int | None:
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str) and v.strip().isdigit():
+        return int(v.strip())
+    return None
+
+
+def title_meta(scraped) -> dict | None:
+    """What the title step matches on, from the queue row's `scraped` (title, authors, year,
+    journal); None when the row cannot be resolved (no title, or a first author whose surname
+    normalizes to nothing: resolve-title.ts `isResolvable`)."""
+    if not isinstance(scraped, dict):
+        return None
+    title = scraped.get("title")
+    if not isinstance(title, str) or norm_text(title) == "":
+        return None
+    authors = scraped.get("authors")
+    first = None
+    if isinstance(authors, list) and authors:
+        first = name_parts(authors[0])
+        if first[0] == "":
+            return None
+    journal = scraped.get("journal")
+    venue_words = [w for w in norm_text(journal).split(" ") if len(w) >= 5] if isinstance(journal, str) else []
+    return {"title": title, "year": _int_year(scraped.get("year")), "author": first,
+            "venue": journal if isinstance(journal, str) else None, "venue_words": venue_words}
+
+
+def title_accept(meta: dict, cand: dict) -> list[str] | None:
+    """The fields that matched (always beginning with 'title'), or None when the candidate is
+    rejected."""
+    t = norm_text(meta["title"])
+    if t == "" or t != norm_text(cand.get("title")):
+        return None
+    matched = ["title"]
+    if meta["year"] is not None:
+        cy = _int_year(cand.get("year"))
+        if cy is None or abs(cy - meta["year"]) > 1:
+            return None
+        matched.append("year")
+    if meta["author"] is not None:
+        surname, initial = meta["author"]
+        ok = False
+        for name in cand.get("authors") or []:
+            cs, ci = name_parts(name)
+            if cs == surname and (initial == "" or ci == initial):
+                ok = True
+                break
+        if not ok:
+            return None
+        matched.append("author")
+    if meta["venue_words"]:
+        cv = set(norm_text(cand.get("venue")).split(" ")) - {""}
+        if not cv or not any(w in cv for w in meta["venue_words"]):
+            return None
+        matched.append("venue")
+    return matched if len(matched) >= 3 else None
+
+
+def _doi_key(doi) -> str | None:
+    if not isinstance(doi, str):
+        return None
+    d = re.sub(r"^https?://(dx\.)?doi\.org/", "", doi.strip(), flags=re.I).strip().lower()
+    return d or None
+
+
+def pick_title(meta: dict, cands: list[dict]) -> tuple[str, dict | None, list[str] | None]:
+    """('one', candidate, matched), ('ambiguous', None, None) when accepted candidates carry two
+    different DOIs, or ('none', None, None). A candidate without a DOI is never accepted."""
+    accepted = []
+    for c in cands:
+        if _doi_key(c.get("doi")) is None:
+            continue
+        m = title_accept(meta, c)
+        if m is not None:
+            accepted.append((c, m))
+    dois = {_doi_key(c.get("doi")) for c, _ in accepted}
+    if len(dois) == 1:
+        return "one", accepted[0][0], accepted[0][1]
+    return ("ambiguous", None, None) if len(dois) > 1 else ("none", None, None)
+
+
+TITLE_CORPUS_SQL = (
+    "SELECT normalize_doi(p.doi), p.title, "
+    "coalesce(p.published_year, extract(year from p.published_date)::int), p.authors, j.name, "
+    "p.openalex_id "
+    "FROM papers p LEFT JOIN journals j ON j.id = p.journal_id "
+    "WHERE p.title %% %s AND p.doi IS NOT NULL "
+    f"ORDER BY similarity(p.title, %s) DESC LIMIT {TITLE_CANDIDATES_MAX}")
+
+
+def corpus_title_candidates(cur, title: str) -> list[dict]:
+    """resolve-title.ts CORPUS_SQL, plus the paper's OpenAlex id."""
+    cur.execute(TITLE_CORPUS_SQL, [title, title])
+    out = []
+    for doi, t, year, authors, venue, oa in cur.fetchall():
+        names = [a.get("name") for a in authors if isinstance(a, dict)] if isinstance(authors, list) else []
+        out.append({"doi": doi, "title": t or "", "year": year, "venue": venue, "openalex_id": oa,
+                    "authors": [n for n in names if isinstance(n, str)]})
+    return out
+
+
+def openalex_title_candidates(title: str, year: int | None) -> list[dict] | None:
+    """resolve-title.ts openAlexCandidates: up to five works from OpenAlex's title search. Unlike
+    resolve-title.ts, a timeout, a non-200 (429 included) or a malformed body answers None, not [],
+    so the drain can tell "OpenAlex could not be asked" from "no candidate" (the former counts no
+    attempt). `api_key` is sent only when OPENALEX_API_KEY is set and not empty."""
+    import httpx
+
+    flt = "title.search:" + re.sub(r"[,:]", " ", title)
+    if year is not None:
+        flt += f",publication_year:{year - 1}-{year + 1}"
+    params = {"filter": flt, "per-page": str(TITLE_CANDIDATES_MAX),
+              "select": "doi,ids,title,publication_year,authorships,primary_location"}
+    if os.environ.get("OPENALEX_EMAIL"):
+        params["mailto"] = os.environ["OPENALEX_EMAIL"]
+    if os.environ.get("OPENALEX_API_KEY"):
+        params["api_key"] = os.environ["OPENALEX_API_KEY"]
+    try:
+        r = httpx.get("https://api.openalex.org/works", params=params, timeout=HTTP_TIMEOUT)
+        if r.status_code != 200:
+            return None
+        results = (r.json() or {}).get("results")
+    except Exception:
+        return None
+    if not isinstance(results, list):
+        return None
+    out = []
+    for w in results[:TITLE_CANDIDATES_MAX]:
+        if not isinstance(w, dict):
+            continue
+        src = ((w.get("primary_location") or {}).get("source") or {})
+        ids = w.get("ids") if isinstance(w.get("ids"), dict) else {}
+        out.append({
+            "doi": _doi_key(w.get("doi")),
+            "title": w.get("title") if isinstance(w.get("title"), str) else "",
+            "year": w.get("publication_year") if isinstance(w.get("publication_year"), int) else None,
+            "authors": [a.get("author", {}).get("display_name") for a in (w.get("authorships") or [])
+                        if isinstance(a, dict) and isinstance(a.get("author"), dict)
+                        and isinstance(a["author"].get("display_name"), str)],
+            "venue": src.get("display_name") if isinstance(src.get("display_name"), str) else None,
+            "openalex_id": ids.get("openalex") if isinstance(ids.get("openalex"), str) else None,
+        })
+    return out
+
+
+def resolve_title(cur, meta: dict | None, *, network: bool = True, corpus=None, openalex=None
+                  ) -> tuple[dict | None, str]:
+    """(match, '') or (None, reason). The corpus first; OpenAlex only when no corpus candidate is
+    accepted and none is ambiguous. A match is {doi, openalex_id, source, matched}. Reasons:
+    unresolvable, ambiguous, no_match, no_network (the corpus missed and OpenAlex was not asked),
+    unavailable (the corpus missed and OpenAlex did not answer 200).
+    `corpus` and `openalex` default to this module's two candidate functions, looked up per call."""
+    corpus = corpus or corpus_title_candidates
+    openalex = openalex or openalex_title_candidates
+    if meta is None:
+        return None, "unresolvable"
+    kind, cand, matched = pick_title(meta, corpus(cur, meta["title"]))
+    source = "corpus"
+    if kind == "none":
+        if not network:
+            return None, "no_network"
+        works = openalex(meta["title"], meta["year"])
+        if works is None:
+            return None, "unavailable"
+        kind, cand, matched = pick_title(meta, works)
+        source = "openalex"
+    if kind == "ambiguous":
+        return None, "ambiguous"
+    if kind == "none":
+        return None, "no_match"
+    return {"doi": _doi_key(cand.get("doi")), "openalex_id": cand.get("openalex_id"),
+            "source": source, "matched": matched}, ""
+
+
+TITLE_MATCH_SQL = ("UPDATE library_capture_queue SET scraped = jsonb_set(scraped, '{title_match}', "
+                   "%s::jsonb, true) WHERE id = %s")
+
+
+def title_miss(cur, qid: str, expired: bool, reason: str, *, dry_run: bool, say=print) -> str:
+    """A title row with no match: one more attempt; at TITLE_MAX_ATTEMPTS, or past
+    FAILED_AFTER_DAYS, the row is `failed`. When OpenAlex could not be asked (`unavailable`) the row
+    is only stamped, so it waits 24 hours, and fails only past FAILED_AFTER_DAYS. Only the queue row
+    is written: a title row never writes the item (no `resolution`, so the item page keeps "Edit
+    details" under contracts/v1's rule; main-loop amendment 2026-11-18). A dry run, and a row the
+    corpus missed in a --no-network run, write nothing."""
+    if dry_run or reason == "no_network":
+        say(f"  [pending] queue={qid} title row: no match ({reason})")
+        return "pending"
+    bump = "" if reason == "unavailable" else "attempts = attempts + 1, "
+    cur.execute(f"UPDATE library_capture_queue SET {bump}last_attempt_at = now() "
+                "WHERE id = %s RETURNING attempts", [qid])
+    n = cur.fetchone()[0]
+    if expired or (reason != "unavailable" and n >= TITLE_MAX_ATTEMPTS):
+        why = f"after {FAILED_AFTER_DAYS} days" if expired else f"after {n} attempts"
+        _resolve(cur, qid, "failed", error=f"no title match ({reason}) {why}")
+        say(f"  [failed]  queue={qid} title row: no match ({reason}) {why}")
+        return "failed"
+    say(f"  [pending] queue={qid} title row: no match ({reason}) attempts={n}")
+    return "pending"
 
 
 # ── corpus lookup ────────────────────────────────────────────────────────────
@@ -493,7 +772,7 @@ def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
     if row is None:
         return None, None
     (qid, item_id, user, doi, arxiv_id, resolved_work, resolved_source, attempts, expired,
-     is_import) = row
+     is_import, scraped) = row
     qid, item_id, user = str(qid), str(item_id), str(user)
     seen.append(qid)
     if is_import and import_ids is not None:
@@ -516,6 +795,24 @@ def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
         if not dry_run:
             _resolve(cur, qid, "linked")
         return qid, "linked"
+
+    # (t) a row with no identifier: its title, under the strict rule; the accepted DOI then takes
+    # every step below, which for a title row writes only the queue row until the link or fold
+    # (no card, no `resolution`; capture-title-resolve, main-loop amendment 2026-11-18)
+    title_row = doi is None and base is None
+    if title_row:
+        stored = scraped.get("title_match") if isinstance(scraped, dict) else None
+        if isinstance(stored, dict) and _doi_key(stored.get("doi")):
+            doi = _doi_key(stored.get("doi"))   # an earlier run matched this row and did not finish it
+        else:
+            match, reason = resolve_title(cur, title_meta(scraped), network=network)
+            if match is None:
+                return qid, title_miss(cur, qid, bool(expired), reason, dry_run=dry_run, say=say)
+            say(f"  [title]   queue={qid} doi={match['doi']} via {match['source']} "
+                f"matched={','.join(match['matched'])}")
+            if not dry_run:
+                cur.execute(TITLE_MATCH_SQL, [json.dumps(match), qid])
+            doi = match["doi"]
 
     # The per-paper lock, BEFORE the corpus lookup: the second capture of one work then sees the
     # first transaction's insert instead of racing it to a duplicate row.
@@ -553,6 +850,15 @@ def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
         if dry_run:
             say(f"  [pending] queue={qid} doi={doi!r} arxiv={base!r} (no record)")
             return qid, "pending"
+        if title_row:
+            cur.execute("UPDATE library_capture_queue SET attempts = attempts + 1, "
+                        "last_attempt_at = now() WHERE id = %s", [qid])
+            if expired:
+                _resolve(cur, qid, "failed", error=f"unresolved after {FAILED_AFTER_DAYS} days")
+                say(f"  [failed]  queue={qid} doi={doi!r} (unresolved after {FAILED_AFTER_DAYS} days)")
+                return qid, "failed"
+            say(f"  [pending] queue={qid} doi={doi!r} attempts={attempts + 1}")
+            return qid, "pending"
         cur.execute(BUMP_SQL, [user])
         v = cur.fetchone()[0]
         cur.execute("UPDATE library_capture_queue SET attempts = attempts + 1, "
@@ -576,9 +882,10 @@ def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
         if dry_run:
             say(f"  [closed]  queue={qid} doi={doi!r} ({reason})")
             return qid, "closed"
-        cur.execute(BUMP_SQL, [user])
-        v = cur.fetchone()[0]
-        set_resolution(cur, item_id, v, "incomplete", source=reason)
+        if not title_row:
+            cur.execute(BUMP_SQL, [user])
+            v = cur.fetchone()[0]
+            set_resolution(cur, item_id, v, "incomplete", source=reason)
         _resolve(cur, qid, "closed", error=reason)
         say(f"  [closed]  queue={qid} doi={doi!r} ({reason})")
         return qid, "closed"
@@ -595,9 +902,10 @@ def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
     else:
         paper_id, inserted, slug, card = ingest_record(conn, resolved_work, resolved_source)
     if paper_id is None:
-        cur.execute(BUMP_SQL, [user])
-        v = cur.fetchone()[0]
-        set_resolution(cur, item_id, v, "incomplete", source="not_a_paper")
+        if not title_row:
+            cur.execute(BUMP_SQL, [user])
+            v = cur.fetchone()[0]
+            set_resolution(cur, item_id, v, "incomplete", source="not_a_paper")
         _resolve(cur, qid, "closed", error="not_a_paper")
         say(f"  [closed]  queue={qid} doi={doi!r} (not_a_paper on normalize)")
         return qid, "closed"
@@ -605,10 +913,11 @@ def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
     linked_disc = 0
     if inserted and slug:
         linked_disc = link_disciplines(cur, paper_id, slug)
-    cur.execute(BUMP_SQL, [user])
-    v = cur.fetchone()[0]
-    set_card(cur, item_id, v, card)
-    set_resolution(cur, item_id, v, "resolved", source=resolved_source)
+    if not title_row:
+        cur.execute(BUMP_SQL, [user])
+        v = cur.fetchone()[0]
+        set_card(cur, item_id, v, card)
+        set_resolution(cur, item_id, v, "resolved", source=resolved_source)
     outcome = link_item(cur, qid, item_id, user, paper_id,
                         collections=collections, merged_into=merged_into, say=say)
     say(f"  [ingest]  queue={qid} paper={paper_id} inserted={inserted} "
@@ -632,16 +941,17 @@ RECORD_ERROR_SQL = (
     f"status = CASE WHEN created_at < now() - interval '{FAILED_AFTER_DAYS} days' THEN 'failed' ELSE status END, "
     f"resolved_at = CASE WHEN created_at < now() - interval '{FAILED_AFTER_DAYS} days' THEN now() ELSE resolved_at END "
     "WHERE id = %s RETURNING status, attempts - 1, library_item_id, user_id, "
-    "to_char(last_attempt_at, 'YYYY-MM-DD\"T\"HH24:MI:SSOF')")
+    "to_char(last_attempt_at, 'YYYY-MM-DD\"T\"HH24:MI:SSOF'), (doi IS NULL AND arxiv_id IS NULL)")
 
 
 def record_error(conn, qid: str, name: str) -> int:
     """Record a raising row's attempt in its own transaction; returns the attempts before it. A row
-    past FAILED_AFTER_DAYS becomes failed and its card incomplete (not_indexed), BUMP first."""
+    past FAILED_AFTER_DAYS becomes failed and its card incomplete (not_indexed), BUMP first; a
+    title row's item is never written."""
     cur = conn.cursor()
     cur.execute(RECORD_ERROR_SQL, [name, qid])
-    status, before, item_id, user, stamp = cur.fetchone()
-    if status == "failed":
+    status, before, item_id, user, stamp, title_row = cur.fetchone()
+    if status == "failed" and not title_row:
         cur.execute(BUMP_SQL, [str(user)])
         v = cur.fetchone()[0]
         set_resolution(cur, str(item_id), v, "incomplete", source="not_indexed", last_attempt_at=stamp)
