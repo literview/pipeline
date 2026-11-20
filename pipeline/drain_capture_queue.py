@@ -84,6 +84,16 @@ reuses it. A title row never writes its item before the link or fold (no card ke
 contracts/v1's editable rule, and the item page's save re-enqueues or resets it (main-loop amendment
 2026-11-18 in the spec).
 
+Books and chapters (ledger task books-drain, owner "3. 가" 2026-11-18). A resolved work of a type in
+ingest_work.BOOK_WORK_TYPES (OpenAlex book, book-chapter, edited-book, monograph; the Crossref types
+mapped to them) is ingested, not closed as `not_article:<type>`: `work_type` set, `publisher` from
+OpenAlex's host organization (else one Crossref call for its DOI, fill_book_gaps), `container_title`
+for a chapter, `source` and `journal_id` NULL (trigger 024 makes no journal row of a publisher
+platform), tier core, and never a discipline link, so a book is never navigable. A book skips the
+20-character title minimum (amendment 2026-11-19). Every other rejected type stays closed; the journal
+crawl does not call would_ingest() and is unchanged. pipeline/reopen_book_rows.py reopens the rows
+closed as a book type before this.
+
 A row whose processing raises (any row): its open transaction is rolled back, but what the row had
 already committed stays (upsert_paper() commits the connection, so an ingested paper and the stored
 `resolved_work` can already be in). The attempt is then recorded in its own transaction:
@@ -123,7 +133,8 @@ sys.path.insert(0, str(ROOT / "pipeline"))
 load_dotenv(ROOT / ".env.local", override=False)
 
 from db import _match_existing as db_match, upsert_paper  # noqa: E402
-from ingest_work import normalize, source_discipline, would_ingest  # noqa: E402
+from ingest_work import (_first_str, book_work_type, crossref_publisher, normalize,  # noqa: E402
+                         normalize_book, source_discipline, would_ingest)
 from merge_papers import BUMP_SQL, _fold_library_rows, has_column, has_table  # noqa: E402
 
 try:
@@ -199,6 +210,25 @@ def advisory_key(doi: str | None, arxiv_base: str | None) -> str | None:
 
 # ── resolution (the same chain the capture route's after() runs) ─────────────
 
+def crossref_work(doi: str) -> dict | None:
+    """Crossref's `message` for one DOI, or None on any failure (a timeout, a non-200, a malformed
+    body). The one Crossref call of this file: resolve_work's second arm, and the book gap fill."""
+    import httpx
+
+    mail = os.environ.get("OPENALEX_EMAIL", "")
+    try:
+        r = httpx.get(f"https://api.crossref.org/works/{doi}", timeout=HTTP_TIMEOUT,
+                      headers={"User-Agent": f"LiterView/1.0 (mailto:{mail})" if mail else "LiterView/1.0"},
+                      follow_redirects=True)
+        if r.status_code == 200:
+            msg = (r.json() or {}).get("message")
+            if isinstance(msg, dict):
+                return msg
+    except Exception:
+        pass
+    return None
+
+
 def resolve_work(doi: str | None, arxiv_base: str | None) -> tuple[dict | None, str | None]:
     """OpenAlex by DOI (or by arXiv's own 10.48550 DOI), then Crossref by DOI (skipped for an
     arXiv identifier, which Crossref does not hold), then the arXiv API. Returns (record,
@@ -220,16 +250,9 @@ def resolve_work(doi: str | None, arxiv_base: str | None) -> tuple[dict | None, 
             pass
 
     if doi and not doi.lower().startswith("10.48550/arxiv."):
-        try:
-            r = httpx.get(f"https://api.crossref.org/works/{doi}", timeout=HTTP_TIMEOUT,
-                          headers={"User-Agent": f"LiterView/1.0 (mailto:{mail})" if mail else "LiterView/1.0"},
-                          follow_redirects=True)
-            if r.status_code == 200:
-                msg = (r.json() or {}).get("message")
-                if isinstance(msg, dict):
-                    return msg, "crossref"
-        except Exception:
-            pass
+        msg = crossref_work(doi)
+        if msg is not None:
+            return msg, "crossref"
 
     if arxiv_base:
         try:
@@ -734,18 +757,60 @@ def trigger_revalidation(paper_id: str, *, from_import: bool = False) -> None:
         print(f"  [warn]    revalidate failed for {who}: {e.__class__.__name__}")
 
 
-def ingest_record(conn, record: dict, source: str) -> tuple[str | None, bool, str | None, dict]:
+BOOK_COLUMNS = ("work_type", "publisher", "container_title")   # migration 105; insert-only here
+
+
+def fill_book_gaps(paper: dict, source: str) -> None:
+    """A book or chapter from an OpenAlex record that lacks the publisher (or, for a chapter, the
+    container title) gets them from ONE Crossref call for its DOI, the call resolve_work makes
+    (books-drain amendment 2026-11-19, D2). Only `publisher` (repaired by crossref_publisher) and
+    `container-title` are read; a failure leaves the keys absent and never fails the row. A
+    Crossref record already carries its own publisher, so it is not asked twice."""
+    if source != "openalex" or not paper.get("work_type"):
+        return
+    chapter = paper["work_type"] == "book-chapter"
+    if paper.get("publisher") and (not chapter or paper.get("container_title")):
+        return
+    doi = _doi_key(paper.get("doi"))
+    if not doi:
+        return
+    msg = crossref_work(doi)
+    if msg is None:
+        return
+    if not paper.get("publisher"):
+        publisher = crossref_publisher(msg.get("publisher"))
+        if publisher:
+            paper["publisher"] = publisher
+    if chapter and not paper.get("container_title"):
+        container = _first_str(msg.get("container-title"))
+        if container:
+            paper["container_title"] = container
+
+
+def ingest_record(conn, record: dict, source: str, *, network: bool = True
+                  ) -> tuple[str | None, bool, str | None, dict]:
     """(paper_id, inserted, discipline_slug, the normalized paper). The record has already
-    passed would_ingest(). `origin`, `vetted` and `corpus_tier` ride in the dict only when no row
-    matches, so they are written by the INSERT branch of upsert_paper() and by nothing else: on a
-    match the UPDATE branch rewrites only the keys present here, and a matched row's own
+    passed would_ingest(..., books=True). `origin`, `vetted` and `corpus_tier` ride in the dict only
+    when no row matches, so they are written by the INSERT branch of upsert_paper() and by nothing
+    else: on a match the UPDATE branch rewrites only the keys present here, and a matched row's own
     origin/vetted/corpus_tier are not among them. `corpus_tier` is 'core' for every venue
     (docs/ledger/user-added-core.md); the slug, None for an unconfigured venue, only decides the
-    caller's link_disciplines()."""
-    paper = normalize(record, source, versionless=True)
+    caller's link_disciplines(). A book or chapter (books-drain) has `work_type` set and no `source`
+    key, so it is inserted with source NULL and journal_id NULL, and its slug is always None: no
+    discipline link, never navigable; on a match its work_type, publisher and container_title are
+    not written. `network=False` skips the book gap fill's Crossref call."""
+    if book_work_type(record, source) is not None:
+        paper = normalize_book(record, source)
+    else:
+        paper = normalize(record, source, versionless=True)   # the article path, unchanged
     if paper is None:
         return None, False, None, {}
-    slug, config_name = source_discipline(paper)
+    if paper.get("work_type"):
+        slug, config_name = None, None
+        if network:
+            fill_book_gaps(paper, source)
+    else:
+        slug, config_name = source_discipline(paper)
     if config_name:
         paper["source"] = config_name
     card = dict(paper)
@@ -756,6 +821,12 @@ def ingest_record(conn, record: dict, source: str) -> tuple[str | None, bool, st
         paper["origin"] = "user-library"
         paper["vetted"] = True
         paper["corpus_tier"] = "core"
+    else:
+        # A matched row keeps its own kind: work_type, publisher and container_title are written on
+        # INSERT only, like origin/vetted/corpus_tier (a book record whose DOI differs from the queue's
+        # can match a crawled journal article through db_match; that article must not become a book).
+        for key in BOOK_COLUMNS:
+            paper.pop(key, None)
     paper_id, inserted = upsert_paper(conn, paper)
     return (str(paper_id) if paper_id else None), inserted, slug, card
 
@@ -880,7 +951,7 @@ def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
         return qid, "pending"
 
     # (iii) a record the crawl would not have taken
-    ok, reason = would_ingest(resolved_work, resolved_source)
+    ok, reason = would_ingest(resolved_work, resolved_source, books=True)
     if not ok:
         if dry_run:
             say(f"  [closed]  queue={qid} doi={doi!r} ({reason})")
@@ -901,9 +972,9 @@ def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
     if is_import:
         # db.py's upsert can print a dedup warning naming the record's DOI and arXiv id
         with contextlib.redirect_stdout(io.StringIO()):
-            paper_id, inserted, slug, card = ingest_record(conn, resolved_work, resolved_source)
+            paper_id, inserted, slug, card = ingest_record(conn, resolved_work, resolved_source, network=network)
     else:
-        paper_id, inserted, slug, card = ingest_record(conn, resolved_work, resolved_source)
+        paper_id, inserted, slug, card = ingest_record(conn, resolved_work, resolved_source, network=network)
     if paper_id is None:
         if not title_row:
             cur.execute(BUMP_SQL, [user])

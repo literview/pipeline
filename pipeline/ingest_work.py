@@ -51,6 +51,24 @@ OPENALEX_REJECT = {"book", "book-chapter", "edited-book", "monograph", "dataset"
                    "reference-entry", "libguides", "paratext", "supplementary-materials",
                    "grant", "standard"}
 
+# Book and chapter types the capture drain INGESTS for a user's queue row (ledger task books-drain,
+# owner "3. 가" 2026-11-18), with the `papers.work_type` each one is written as (migration 105's CHECK
+# allows exactly these four values). One table for both sources; every other rejected type stays
+# rejected, and the journal crawl never reads it. The names stay in OPENALEX_REJECT / CROSSREF_REJECT
+# above: only `would_ingest(..., books=True)` (the drain) looks here first.
+BOOK_WORK_TYPES = {
+    "openalex": {"book": "book", "book-chapter": "book-chapter", "edited-book": "edited-book",
+                 "monograph": "monograph"},
+    "crossref": {"book": "book", "reference-book": "book",
+                 "book-chapter": "book-chapter", "book-section": "book-chapter", "book-part": "book-chapter",
+                 "edited-book": "edited-book", "monograph": "monograph"},
+}
+
+# A book on the user path skips the 20-character title minimum (books-drain amendment 2026-11-19, D1):
+# short book titles are common ("Losers' Consent"). It still needs a non-empty title that is not the
+# source's name and at least one named author.
+BOOK_MIN_TITLE = 1
+
 ARXIV_VERSION = re.compile(r"v[0-9]+$")
 
 # OpenAlex source id (URL form) -> (discipline slug, the config's own journal name).
@@ -78,8 +96,9 @@ def reconstruct_abstract(inverted_index: dict | None) -> str | None:
     return " ".join(word for _, word in words)
 
 
-def is_valid_paper(title: str, source: str | None, authors: list) -> bool:
-    """Validate that this is a real paper."""
+def is_valid_paper(title: str, source: str | None, authors: list, *, min_title: int = 20) -> bool:
+    """Validate that this is a real paper. `min_title` is lowered only for a book on the drain's
+    user path (BOOK_MIN_TITLE); every other caller keeps the 20-character minimum."""
     if not title:
         return False
 
@@ -89,7 +108,7 @@ def is_valid_paper(title: str, source: str | None, authors: list) -> bool:
     if source_lower and title_lower == source_lower:
         return False
 
-    if len(title) < 20:
+    if len(title) < min_title:
         return False
 
     if not authors or len(authors) == 0:
@@ -229,7 +248,7 @@ def openalex_pdf_url(work: dict) -> str | None:
 
 # ── normalizers ──────────────────────────────────────────────────────────────
 
-def normalize_openalex(work: dict) -> dict | None:
+def normalize_openalex(work: dict, *, min_title: int = 20) -> dict | None:
     """Convert OpenAlex work to our paper format."""
     title = work.get("title")
     if not title:
@@ -265,7 +284,7 @@ def normalize_openalex(work: dict) -> dict | None:
         source = primary_location["source"].get("display_name")
         source_openalex_id = primary_location["source"].get("id")
 
-    if not is_valid_paper(title, source, authors):
+    if not is_valid_paper(title, source, authors, min_title=min_title):
         return None
 
     return {
@@ -285,7 +304,7 @@ def normalize_openalex(work: dict) -> dict | None:
     }
 
 
-def normalize_crossref(item: dict, journal_name: str | None = None) -> dict | None:
+def normalize_crossref(item: dict, journal_name: str | None = None, *, min_title: int = 20) -> dict | None:
     """A Crossref work in our paper format. `journal_name` defaults to the record's own
     container-title; unlike ingest_crossref.py this never falls back to OpenAlex for a missing
     abstract (one network call per row inside a transaction is not worth an abstract the daily
@@ -299,7 +318,7 @@ def normalize_crossref(item: dict, journal_name: str | None = None) -> dict | No
         return None
     title = title_list[0] if isinstance(title_list, list) else str(title_list)
 
-    if not title or len(title) < 20:
+    if not title or len(title) < min_title:
         return None
 
     if journal_name is None:
@@ -440,17 +459,96 @@ _NORMALIZERS = {
 }
 
 
-def normalize(record: dict | None, source: str, *, versionless: bool = False) -> dict | None:
-    """The `papers` dict `upsert_paper()` takes, or None when the record is not a paper."""
+# ── books and chapters (books-drain) ─────────────────────────────────────────
+
+_PRESS_GLUED = re.compile(r"^(.+ Press)(?=[A-Z])")
+
+
+def crossref_publisher(value) -> str | None:
+    """A Crossref `publisher`, trimmed, with one deposit defect repaired: a capital letter glued
+    straight after "Press" ("Oxford University PressOxford") is cut off after "Press" (books-drain
+    amendment 2026-11-19). OpenAlex's host_organization_name is never passed through this."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    value = value.strip()
+    m = _PRESS_GLUED.match(value)
+    return m.group(1) if m else value
+
+
+def _first_str(value) -> str | None:
+    """The first non-empty string of a Crossref list field (or the field itself when a string)."""
+    if isinstance(value, list):
+        value = next((v for v in value if isinstance(v, str) and v.strip()), None)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def book_work_type(record: dict | None, source: str) -> str | None:
+    """The `papers.work_type` of a book or chapter record, or None for every other record."""
+    if not isinstance(record, dict):
+        return None
+    return BOOK_WORK_TYPES.get(source, {}).get(record.get("type") or "")
+
+
+def normalize_book(record: dict, source: str) -> dict | None:
+    """A book or chapter in the `papers` format, for the drain's user path only. It is the
+    source's own normalization with the title minimum lowered to BOOK_MIN_TITLE, and then:
+    `work_type` set; `publisher` from OpenAlex primary_location.source.host_organization_name, or
+    Crossref `publisher`; `container_title` for a chapter (Crossref `container-title`; OpenAlex
+    carries none); and NO `source` key, so the insert writes source NULL and trigger 024 never makes
+    a journal row of a publisher platform (amendment 2026-11-18), and a matched row's source is
+    left alone. `publisher` and `container_title` are present only when there is a value."""
+    work_type = book_work_type(record, source)
+    if work_type is None:
+        return None
+    title = record.get("title")
+    if isinstance(title, list):
+        title = title[0] if title else None
+    if not isinstance(title, str) or not title.strip():
+        return None
+    if source == "openalex":
+        paper = normalize_openalex(record, min_title=BOOK_MIN_TITLE)
+        src = (record.get("primary_location") or {}).get("source") or {}
+        host = src.get("host_organization_name")
+        publisher = host.strip() if isinstance(host, str) and host.strip() else None
+        container = None
+    elif source == "crossref":
+        paper = normalize_crossref(record, min_title=BOOK_MIN_TITLE)
+        publisher = crossref_publisher(record.get("publisher"))
+        container = _first_str(record.get("container-title")) if work_type == "book-chapter" else None
+    else:
+        return None
+    if paper is None:
+        return None
+    paper.pop("source", None)
+    paper.pop("source_openalex_id", None)
+    paper["work_type"] = work_type
+    if publisher:
+        paper["publisher"] = publisher
+    if container:
+        paper["container_title"] = container
+    return paper
+
+
+def normalize(record: dict | None, source: str, *, versionless: bool = False,
+              books: bool = False) -> dict | None:
+    """The `papers` dict `upsert_paper()` takes, or None when the record is not a paper. With
+    `books=True` (the capture drain's user queue rows) a book or chapter is normalized by
+    normalize_book(); every other record, and every record when `books` is False, as before."""
     if not record or source not in _NORMALIZERS:
         return None
+    if books and book_work_type(record, source) is not None:
+        return normalize_book(record, source)
     return _NORMALIZERS[source](record, versionless=versionless)
 
 
 # ── the accept test ──────────────────────────────────────────────────────────
 
-def would_ingest(record: dict | None, source: str) -> tuple[bool, str | None]:
+def would_ingest(record: dict | None, source: str, *, books: bool = False) -> tuple[bool, str | None]:
     """Would the crawl have taken this work? Returns (True, None) or (False, reason).
+
+    With `books=True` (the capture drain's user queue rows, books-drain) a record of a type in
+    BOOK_WORK_TYPES is taken when normalize_book() accepts it, before the reject sets are read;
+    every other type is judged as below.
 
     Reasons, all machine-readable and safe to show a user:
       no_record              nothing resolved
@@ -464,6 +562,9 @@ def would_ingest(record: dict | None, source: str) -> tuple[bool, str | None]:
         return False, "no_record"
     if source not in SOURCES:
         return False, f"unknown_source:{source}"
+
+    if books and book_work_type(record, source) is not None:
+        return (True, None) if normalize_book(record, source) is not None else (False, "not_a_paper")
 
     if source == "crossref":
         ctype = record.get("type") or ""
