@@ -40,6 +40,7 @@ JOURNALS_BY_DISCIPLINE = {
         "S48869744": "Legislative Studies Quarterly",
         "S975761300": "PS: Political Science & Politics",
         "S6959732": "Party Politics",
+        "S173657377": "Perspectives on Politics",  # ISSN: 1537-5927
         "S119514724": "Policy Studies Journal",
         "S29331042": "Political Analysis",
         "S110036823": "Political Behavior",
@@ -78,6 +79,7 @@ JOURNALS_BY_DISCIPLINE = {
         "S76877748": "Public Administration Review",
         "S37623806": "Public Management Review",
         "S17185278": "Public Policy and Administration",
+        "S7407089665": "Public Policy Journal",  # ISSN: 3055-974X
         "S108218269": "Regulation & Governance",
         "S54913114": "Review of Policy Research",
     },
