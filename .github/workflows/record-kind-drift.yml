@@ -1,0 +1,65 @@
+name: Repair stored record kinds
+
+# LiterView ledger task list-nonresearch-filter (migration 080). papers.record_kind holds the title rule's
+# kind (pipeline/record_kind.py, a copy of the LiterView master: erratum, book-review, supplement, paratext,
+# editorial; NULL for research) and the topic lists hide the first four. ingest.yml stores it for the rows
+# created in the last three days; this weekly run recomputes it over every papers row and repairs each row
+# whose stored kind differs (a title edited after insert, a missed ingest step, a crawl gap over three
+# days, a rule edit), with pipeline/backfill_record_kind.py --drift --fix: one read of every title (about
+# 30 s) and an UPDATE by id of the rows that differ, in one transaction.
+#
+# Weekly, Sunday 09:23 UTC (after journal-counts at 08:17, off the drain's :04 and :34 dispatches), and by
+# hand. The log lists up to 20 repaired ids per direction; a repair in any run means rows drifted, and
+# there is no other notification for that. A failure (a database error; nothing is written) sends the
+# email below.
+#
+# This repository is public: the job prints paper ids and kinds, which are public data, and never the
+# connection string. The 60-day auto-disable of scheduled workflows in a public repository is covered by
+# gh-cron-watchdog.
+
+on:
+  schedule:
+    - cron: '23 9 * * 0'
+  workflow_dispatch:
+
+concurrency:
+  group: record-kind-drift
+  cancel-in-progress: false
+
+jobs:
+  drift:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: requirements-ingest.txt
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements-ingest.txt
+
+      - name: Recompute and repair papers.record_kind
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        working-directory: pipeline
+        run: python backfill_record_kind.py --drift --fix
+
+      - name: Notify on failure (email)
+        if: failure()
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python3 pipeline/alert_email.py \
+            --title "LiterView record-kind-drift FAILED" \
+            --body "record-kind-drift.yml failed, so papers.record_kind was not checked this week (a database error; nothing was written). Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"

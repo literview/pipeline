@@ -481,6 +481,8 @@ def normalize_openalex(work: dict) -> dict | None:
         "pdf_url": pdf_url,
         "openalex_id": work.get("id"),
         "citation_count": work.get("cited_by_count", 0),
+        # OpenAlex `type` as received (migration 080, papers.openalex_type; docs/ledger/list-nonresearch-filter.md O7)
+        "openalex_type": work.get("type"),
         "concept_ids": concept_ids,  # For discipline/subfield linking
         **biblio_from_openalex(work),  # absent keys when biblio has no value
     }

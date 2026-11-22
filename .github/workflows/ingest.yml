@@ -93,6 +93,21 @@ jobs:
         run: python drain_capture_queue.py
         continue-on-error: true
 
+      # LiterView list-nonresearch-filter (migration 080): store papers.record_kind, the title rule's kind
+      # (book review, correction, supplement, front matter, editorial), for the rows created in the last
+      # three days, after every source above has landed its papers, so the topic lists hide them from this
+      # cycle on. Writes by id only the rows whose stored kind differs. record_kind.py and
+      # backfill_record_kind.py are copies of the LiterView masters. A row this step misses (a failed run,
+      # a crawl gap over three days, a title edited later) is repaired by the weekly record-kind-drift.yml,
+      # so the step does not page (same policy as the secondary sources).
+      - name: Store the record kind of new papers
+        if: always()
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        working-directory: pipeline
+        run: python backfill_record_kind.py --since 3d
+        continue-on-error: true
+
       # Bust the LiterView ISR cache so author/journal/subfield/discipline feed
       # pages reflect the papers just ingested, instead of waiting for their TTL.
       # Best-effort: never fails the ingest job. No-op until the three secrets

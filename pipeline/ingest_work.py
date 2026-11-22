@@ -300,6 +300,8 @@ def normalize_openalex(work: dict, *, min_title: int = 20) -> dict | None:
         "pdf_url": pdf_url,
         "openalex_id": work.get("id"),
         "citation_count": work.get("cited_by_count", 0),
+        # OpenAlex `type` as received (migration 080, papers.openalex_type; docs/ledger/list-nonresearch-filter.md O7)
+        "openalex_type": work.get("type"),
         **biblio_from_openalex(work),
     }
 
