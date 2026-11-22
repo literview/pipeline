@@ -71,13 +71,43 @@ BOOK_MIN_TITLE = 1
 
 ARXIV_VERSION = re.compile(r"v[0-9]+$")
 
-# OpenAlex source id (URL form) -> (discipline slug, the config's own journal name).
-_SOURCE_INDEX: dict[str, tuple[str, str]] = {}
-_NAME_INDEX: dict[str, tuple[str, str]] = {}
+# Disciplines whose shared journals link a paper to every one of them (ledger task ingest-multi-discipline-link, owner
+# "가" 2026-11-09): a journal listed under both political science and public policy gives its papers both links. A
+# journal on any other pair of lists (Administrative Science Quarterly, the three finance journals) keeps its first
+# listed discipline until a primary-discipline rule is decided. Moved here from ingest_journals.py (ledger task
+# ingest-work-fixes), which imports both back, so the crawl, the Crossref ingest, the backfill, the capture drain and
+# promote_captured.py apply one rule.
+MULTI_LINK_SLUGS = frozenset({"political-science", "public-policy"})
+
+
+def link_slugs_for(slugs: list[str]) -> list[str]:
+    """The disciplines a journal's papers link to, from its listed slugs in config order: every slug when all of them are
+    in MULTI_LINK_SLUGS, otherwise the first only. Journal ingest, Crossref ingest and the backfill all call this."""
+    if slugs and all(s in MULTI_LINK_SLUGS for s in slugs):
+        return list(slugs)
+    return list(slugs[:1])
+
+
+# The configured journals, by OpenAlex source id (URL form) and by case-folded name, built in two passes: first every
+# journal's listed slugs in config order (the loop of ingest_journals.main()), then link_slugs_for over them. A journal
+# carries one name in all its listings. _SOURCE_LINKS / _NAME_LINKS hold (link slugs, config name); _SOURCE_INDEX /
+# _NAME_INDEX keep their older (slug, config name) shape with the first link slug, for rehearse_067.py.
+_listed_by_source: dict[str, list[str]] = {}
+_listed_by_name: dict[str, list[str]] = {}
+_config_name: dict[str, str] = {}
 for _slug, _journals in JOURNALS_BY_DISCIPLINE.items():
     for _sid, _name in _journals.items():
-        _SOURCE_INDEX[f"https://openalex.org/{_sid}"] = (_slug, _name)
-        _NAME_INDEX[_name.strip().lower()] = (_slug, _name)
+        _url, _key = f"https://openalex.org/{_sid}", _name.strip().lower()
+        _listed_by_source.setdefault(_url, []).append(_slug)
+        _listed_by_name.setdefault(_key, []).append(_slug)
+        _config_name.setdefault(_url, _name)
+        _config_name.setdefault(_key, _name)
+_SOURCE_LINKS: dict[str, tuple[list[str], str]] = {
+    k: (link_slugs_for(v), _config_name[k]) for k, v in _listed_by_source.items()}
+_NAME_LINKS: dict[str, tuple[list[str], str]] = {
+    k: (link_slugs_for(v), _config_name[k]) for k, v in _listed_by_name.items()}
+_SOURCE_INDEX: dict[str, tuple[str, str]] = {k: (v[0][0], v[1]) for k, v in _SOURCE_LINKS.items()}
+_NAME_INDEX: dict[str, tuple[str, str]] = {k: (v[0][0], v[1]) for k, v in _NAME_LINKS.items()}
 
 
 # ── shared helpers (verbatim from ingest_journals.py) ────────────────────────
@@ -581,17 +611,22 @@ def would_ingest(record: dict | None, source: str, *, books: bool = False) -> tu
     return (True, None) if normalize(record, source) is not None else (False, "not_a_paper")
 
 
-def source_discipline(paper: dict | None) -> tuple[str | None, str | None]:
-    """(discipline slug, the config's journal name) when this paper's venue is one of the
-    crawled journals, else (None, None). Matched on the OpenAlex source id first — the key
-    `ingest_journals.py` uses — then on an exact (case-folded) journal name, which is how a
-    Crossref record or an arXiv journal_ref names the same venue."""
+def source_disciplines(paper: dict | None) -> tuple[list[str], str | None]:
+    """(the discipline slugs the journal crawl links, the config's journal name) when this paper's
+    venue is one of the crawled journals, else ([], None). The slugs are link_slugs_for() over the
+    journal's listed slugs in config order: both for a journal on the Politics and the Policy lists,
+    the first listing for any other journal on two lists. Matched on the OpenAlex source id first,
+    the key `ingest_journals.py` uses, then on an exact (case-folded) journal name, which is how a
+    Crossref record or an arXiv journal_ref names the same venue. Replaces source_discipline(),
+    whose index kept the last listing of a journal (ledger task ingest-work-fixes)."""
     if not paper:
-        return None, None
+        return [], None
     sid = paper.get("source_openalex_id")
-    if sid and sid in _SOURCE_INDEX:
-        return _SOURCE_INDEX[sid]
-    name = (paper.get("source") or "").strip().lower()
-    if name and name in _NAME_INDEX:
-        return _NAME_INDEX[name]
-    return None, None
+    if sid and sid in _SOURCE_LINKS:
+        slugs, name = _SOURCE_LINKS[sid]
+        return list(slugs), name
+    key = (paper.get("source") or "").strip().lower()
+    if key and key in _NAME_LINKS:
+        slugs, name = _NAME_LINKS[key]
+        return list(slugs), name
+    return [], None

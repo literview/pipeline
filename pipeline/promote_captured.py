@@ -2,7 +2,7 @@
 
 Ledger task lp3-capture-proof (docs/ledger/lp3-capture-proof.md, change 6); migration 067. Until
 2026-11-18 the capture drain (drain_capture_queue.py) wrote a captured paper as
-`corpus_tier = 'staged'` when `source_discipline()` did not resolve its venue to a configured
+`corpus_tier = 'staged'` when its venue lookup (now `source_disciplines()`) did not resolve it to a configured
 journal; since docs/ledger/user-added-core.md it writes every new paper `core`, so the staged rows
 are the ones written before that. A staged paper is in no list or corpus-wide computation, and the
 guarded triggers skipped it: no author links, no `journals.paper_count`. Promotion is:
@@ -56,7 +56,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "pipeline"))
 load_dotenv(ROOT / ".env.local", override=False)
 
-from ingest_work import source_discipline  # noqa: E402
+from ingest_work import source_disciplines  # noqa: E402
 from drain_capture_queue import link_disciplines  # noqa: E402
 
 try:
@@ -80,14 +80,16 @@ CLOSE_SQL = ("UPDATE promote_runs SET finished_at = now(), papers_changed = %s, 
              "WHERE run_id = %s")
 
 
-def resolve(source: str | None, journal_name: str | None) -> str | None:
-    """The discipline slug for a staged paper's venue, or None while the corpus does not cover it."""
+def resolve(source: str | None, journal_name: str | None) -> list[str]:
+    """The discipline slugs for a staged paper's venue, the ones the journal crawl links (both for a
+    journal on the Politics and the Policy lists; ledger task ingest-work-fixes), or [] while the
+    corpus does not cover it."""
     for name in (source, journal_name):
         if name:
-            slug, _config_name = source_discipline({"source": name})
-            if slug:
-                return slug
-    return None
+            slugs, _config_name = source_disciplines({"source": name})
+            if slugs:
+                return slugs
+    return []
 
 
 def new_run_id(prefix: str = "captured") -> str:
@@ -113,15 +115,15 @@ def run(conn, *, apply: bool = False, limit: int | None = None, run_id: str | No
     counts["staged"] = len(rows)
 
     for paper_id, source, journal_name in rows:
-        slug = resolve(source, journal_name)
-        if slug:
+        slugs = resolve(source, journal_name)
+        if slugs:
             counts["resolved"] += 1
         else:
             counts["unresolved"] += 1
             if not all_user_added:
                 continue
         if not apply:
-            print(f"  [would promote] paper={paper_id} discipline={slug or '-'}")
+            print(f"  [would promote] paper={paper_id} discipline={','.join(slugs) or '-'}")
             continue
         try:
             cur.execute(PROMOTE_SQL, [paper_id])
@@ -130,17 +132,17 @@ def run(conn, *, apply: bool = False, limit: int | None = None, run_id: str | No
                 counts["lost"] += 1
                 print(f"  [skip]    paper={paper_id} (no longer staged)")
                 continue
-            if slug:
+            for slug in slugs:
                 counts["disciplines_linked"] += link_disciplines(cur, paper_id, slug)
             conn.commit()
         except Exception:
             conn.rollback()
             raise
         counts["promoted"] += 1
-        if not slug:
+        if not slugs:
             counts["promoted_without_discipline"] += 1
         promoted_ids.append(paper_id)
-        print(f"  [promote] paper={paper_id} discipline={slug or '-'}")
+        print(f"  [promote] paper={paper_id} discipline={','.join(slugs) or '-'}")
 
     if apply:
         notes = dict(counts, promoted_ids=promoted_ids) if all_user_added else counts

@@ -70,6 +70,39 @@ def execute_write(conn, sql, params=None):
         raise
 
 
+def _write_in_transaction(conn, sql, params=None):
+    """execute_write() without its commit and without its rollback: the caller owns the transaction
+    (upsert_paper(commit=False), the capture drain's one transaction per queue row)."""
+    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+        cur.execute(sql, params)
+        if cur.description:
+            return [dict(row) for row in cur.fetchall()]
+        return []
+
+
+_INSERT_SAVEPOINT = "upsert_paper_insert"
+
+
+def _insert_under_savepoint(conn, sql, params):
+    """The INSERT of upsert_paper(commit=False), inside a savepoint: a failed INSERT (a concurrent
+    writer's unique key, above all) rolls back to the savepoint and leaves the caller's transaction,
+    its row locks and its earlier writes in place."""
+    with conn.cursor() as cur:
+        cur.execute(f"SAVEPOINT {_INSERT_SAVEPOINT}")
+    try:
+        rows = _write_in_transaction(conn, sql, params)
+    except Exception:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {_INSERT_SAVEPOINT}")
+        except Exception:  # noqa: BLE001 - a dropped connection: the INSERT's own error is the one to raise
+            pass
+        raise
+    with conn.cursor() as cur:
+        cur.execute(f"RELEASE SAVEPOINT {_INSERT_SAVEPOINT}")
+    return rows
+
+
 def _adapt(v):
     """Wrap dict / list-of-dict values with psycopg2 Json adapter for JSONB columns.
     Lists of scalars (e.g. arxiv categories -> TEXT[]) are left as-is so psycopg2
@@ -224,7 +257,7 @@ def _match_existing(conn, paper: dict):
     return None
 
 
-def upsert_paper(conn, paper: dict) -> tuple[str | None, bool]:
+def upsert_paper(conn, paper: dict, *, commit: bool = True) -> tuple[str | None, bool]:
     """
     Insert or update a paper. Returns (paper_id, inserted) -- `inserted` is True only when this
     call created the row, which is what the capture drain needs in order to link disciplines and
@@ -232,7 +265,14 @@ def upsert_paper(conn, paper: dict) -> tuple[str | None, bool]:
     Deduplication is based on openalex_id, doi, or arxiv_id (the last both versionless and exact)
     -- checked against `papers` first, then against `paper_redirects` (a paper that was merged
     away must resolve to its winner, never be re-created).
+
+    `commit=True` (every crawl writer): each write commits, and a failed INSERT rolls the
+    connection back, as before. `commit=False` (the capture drain, ledger task ingest-work-fixes):
+    nothing here commits or rolls back the connection, so the caller's transaction keeps its locks
+    to its own end; the INSERT runs inside a savepoint, and a unique violation rolls back to it
+    before the one re-select.
     """
+    write = execute_write if commit else _write_in_transaction
 
     # The one place well-formed HTML character references are decoded, and publisher
     # extraction defects repaired, on the write path
@@ -268,8 +308,8 @@ def upsert_paper(conn, paper: dict) -> tuple[str | None, bool]:
             fill = [c for c in paper if c in PRESERVE_IF_EMPTY]
             if fill:
                 set_clause = build_fill_empty_set_clause(fill)
-                execute_write(conn, f"UPDATE papers SET {set_clause} WHERE id = %s",
-                              [_adapt(paper[c]) for c in fill] + [winner])
+                write(conn, f"UPDATE papers SET {set_clause} WHERE id = %s",
+                      [_adapt(paper[c]) for c in fill] + [winner])
             return winner, False
 
     if existing:
@@ -288,7 +328,7 @@ def upsert_paper(conn, paper: dict) -> tuple[str | None, bool]:
         if cols:
             set_clause = build_update_set_clause(cols)
             values = [_adapt(paper[c]) for c in cols] + [existing["id"]]
-            execute_write(conn, f"UPDATE papers SET {set_clause} WHERE id = %s", values)
+            write(conn, f"UPDATE papers SET {set_clause} WHERE id = %s", values)
         return existing["id"], False
     else:
         # Insert new paper
@@ -296,13 +336,18 @@ def upsert_paper(conn, paper: dict) -> tuple[str | None, bool]:
         placeholders = ", ".join(["%s"] * len(cols))
         col_names = ", ".join(cols)
         values = [_adapt(paper[c]) for c in cols]
+        insert_sql = f"INSERT INTO papers ({col_names}) VALUES ({placeholders}) RETURNING id"
         try:
-            rows = execute_write(conn, f"INSERT INTO papers ({col_names}) VALUES ({placeholders}) RETURNING id", values)
+            if commit:
+                rows = execute_write(conn, insert_sql, values)
+            else:
+                rows = _insert_under_savepoint(conn, insert_sql, values)
         except psycopg2.errors.UniqueViolation:
             # A concurrent writer (a crawl racing the capture drain) inserted the same
             # openalex_id / doi / arxiv_id between the lookups above and this INSERT; each of
-            # those keys carries a unique index. execute_write has already rolled back, so one
-            # re-select answers who won. Any other integrity error is a real defect and is raised.
+            # those keys carries a unique index. execute_write has already rolled back (with
+            # commit=False, the savepoint has), so one re-select answers who won. Any other
+            # integrity error is a real defect and is raised.
             raced = _match_existing(conn, paper)
             if raced:
                 return raced["id"], False

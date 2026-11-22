@@ -20,7 +20,9 @@ Invariants:
     `corpus_tier = 'core'`, whatever its venue (owner decision 2026-11-18, docs/ledger/
     user-added-core.md, replacing the staged tier of migration 067 for user-added papers): the
     insert runs the author resolver and counts the paper in its journal, so it is searchable and on
-    its author and journal pages. `source_discipline()` still decides the discipline link: a paper
+    its author and journal pages. `source_disciplines()` still decides the discipline links, the ones
+    the journal crawl gives the journal (both for a journal on the Politics and the Policy lists, the
+    first listing for any other journal on two lists): a paper
     whose venue is not a configured journal gets none, so it is not navigable and stays out of the
     discipline lists, For you and the sitemap, and its page is noindex. When `upsert_paper()`
     MATCHES an existing row the drain links the item and changes nothing on the paper — it never
@@ -32,9 +34,14 @@ Invariants:
     lock order as the app and the corpus merge). A bump that bypasses the counter can be ordered
     below a concurrent web push, and every client's sync cursor then skips the drain's write.
   * One transaction per queue row, claimed with `FOR UPDATE SKIP LOCKED` so two runs (the
-    30-minute schedule and a per-capture repository_dispatch) never take the same row. Inside it,
-    `pg_advisory_xact_lock` on the identifier makes the second capture of one paper wait for the
-    first's COMMIT instead of inserting a duplicate.
+    30-minute schedule, a per-capture repository_dispatch, ingest.yml's drain step or a hand run)
+    never take the same row. Inside it, `pg_advisory_xact_lock` on the identifier makes the second
+    capture of one paper wait for the first's COMMIT instead of inserting a duplicate. The row's
+    `upsert_paper()` runs with `commit=False` (ledger task ingest-work-fixes): before that it
+    committed the connection mid-row, which released the claim and the advisory lock, so a second
+    drain could claim the same row and deadlock against the first on the row and the user's counter.
+    The user's counter is taken just before the row's corpus match and `upsert_paper()`, so a row
+    holds it before any `papers`, journal or author row, the order a corpus merge takes them in.
   * Linking is merge-aware and goes through the fold `merge_papers` already has
     (`_fold_library_rows`). Setting `paper_id` on the external row while the user already holds a
     row for that paper would violate UNIQUE (user_id, paper_id); instead the external row is
@@ -94,14 +101,16 @@ platform), tier core, and never a discipline link, so a book is never navigable.
 crawl does not call would_ingest() and is unchanged. pipeline/reopen_book_rows.py reopens the rows
 closed as a book type before this.
 
-A row whose processing raises (any row): its open transaction is rolled back, but what the row had
-already committed stays (upsert_paper() commits the connection, so an ingested paper and the stored
-`resolved_work` can already be in). The attempt is then recorded in its own transaction:
+A row whose processing raises (any row): its transaction is rolled back whole, the paper it
+inserted, its discipline links and the stored `resolved_work` included, and the next run that claims
+it does the row again. The attempt is then recorded in its own transaction:
 `attempts + 1`, `last_attempt_at = now()`, `last_error` = the exception's class name (never its
 message, which can carry a DOI). The row stays pending, so the claim predicate's backoff skips it on
 the next runs, until it is older than FAILED_AFTER_DAYS: then it becomes `failed` and its card
 `incomplete` (not_indexed), as the expiry of a row that resolves nothing does. The run goes on with
-the next row up to its limit. The log line names the queue id and the exception class only. The
+the next row up to its limit. The log line names the queue id and the exception class only; a
+`DeadlockDetected` also prints its DETAIL and CONTEXT, which name processes, transactions, tuples
+and relations and never a value. The
 process exits non-zero when a row raised on its first attempt (`attempts` was 0), so the workflow's
 failure mail fires once per bad row, and when the run could not claim a row or record an attempt.
 
@@ -134,7 +143,7 @@ load_dotenv(ROOT / ".env.local", override=False)
 
 from db import _match_existing as db_match, upsert_paper  # noqa: E402
 from ingest_work import (_first_str, book_work_type, crossref_publisher, normalize,  # noqa: E402
-                         normalize_book, source_discipline, would_ingest)
+                         normalize_book, source_disciplines, would_ingest)
 from merge_papers import BUMP_SQL, _fold_library_rows, has_column, has_table  # noqa: E402
 
 try:
@@ -149,8 +158,10 @@ FOLD_COLS = "id, deleted_at IS NULL, starred, read_status, memo, added_at, ext_m
 # papers.arxiv_id version-suffixed, e.g. 2608.10993v1; the drain stores it versionless;
 # idx_papers_arxiv_id_base backs the papers side).
 ARXIV_VERSION = re.compile(r"v[0-9]+$")
+# The lock tag of an advisory lock in a deadlock's DETAIL ("advisory lock [16384,0,1234567,1]").
+ADVISORY_TAG = re.compile(r"advisory lock \[[^\]]*\]")
 
-OUTCOMES = ("pending", "linked", "merged", "closed", "failed")
+OUTCOMES =("pending", "linked", "merged", "closed", "failed")
 
 DEFAULT_LIMIT = 200
 FAILED_AFTER_DAYS = 14
@@ -703,8 +714,9 @@ def link_item(cur, qid: str, item_id: str, user: str, paper: str, *,
     cur.execute(f"SELECT {FOLD_COLS} FROM library_items WHERE id = %s", [item_id])
     l_row = cur.fetchone()
     if w_row is not None and str(w_row[0]) == str(item_id):
-        # The item already points at the paper: a second drain linked it after this one's
-        # upsert_paper() committed mid-row and released the claim. Folding it into itself would
+        # The item already points at the paper while its queue row is still pending: another writer
+        # (the app, a corpus merge) linked it. Before ingest-work-fixes a second drain could do it too,
+        # after this one's upsert_paper() committed mid-row. Folding the item into itself would
         # delete its reading_state and memberships and tombstone it, so it is only recorded.
         say(f"  [linked]  queue={qid} paper={paper} v={v} (already linked)")
         _resolve(cur, qid, "linked")
@@ -787,35 +799,47 @@ def fill_book_gaps(paper: dict, source: str) -> None:
             paper["container_title"] = container
 
 
-def ingest_record(conn, record: dict, source: str, *, network: bool = True
-                  ) -> tuple[str | None, bool, str | None, dict]:
-    """(paper_id, inserted, discipline_slug, the normalized paper). The record has already
+def ingest_record(conn, record: dict, source: str, *, network: bool = True, user: str | None = None
+                  ) -> tuple[str | None, bool, list[str], dict]:
+    """(paper_id, inserted, discipline slugs, the normalized paper). The record has already
     passed would_ingest(..., books=True). `origin`, `vetted` and `corpus_tier` ride in the dict only
     when no row matches, so they are written by the INSERT branch of upsert_paper() and by nothing
     else: on a match the UPDATE branch rewrites only the keys present here, and a matched row's own
     origin/vetted/corpus_tier are not among them. `corpus_tier` is 'core' for every venue
-    (docs/ledger/user-added-core.md); the slug, None for an unconfigured venue, only decides the
+    (docs/ledger/user-added-core.md); the slugs, none for an unconfigured venue, only decide the
     caller's link_disciplines(). A book or chapter (books-drain) has `work_type` set and no `source`
-    key, so it is inserted with source NULL and journal_id NULL, and its slug is always None: no
+    key, so it is inserted with source NULL and journal_id NULL, and it has no slug: no
     discipline link, never navigable; on a match its work_type, publisher and container_title are
-    not written. `network=False` skips the book gap fill's Crossref call."""
+    not written. `network=False` skips the book gap fill's Crossref call.
+
+    The write keeps the caller's transaction open (`upsert_paper(..., commit=False)`), so the queue
+    row's claim and the advisory lock last to the row's end. With `user`, the user's counter
+    (BUMP_SQL) is taken after the network call and before db_match and the write, so the row holds it
+    before any `papers`, journal or author row, and no lock wait sits between the match that decides
+    the insert-only keys and the write (ledger task ingest-work-fixes)."""
     if book_work_type(record, source) is not None:
         paper = normalize_book(record, source)
     else:
         paper = normalize(record, source, versionless=True)   # the article path, unchanged
     if paper is None:
-        return None, False, None, {}
+        return None, False, [], {}
     if paper.get("work_type"):
-        slug, config_name = None, None
+        slugs, config_name = [], None
         if network:
             fill_book_gaps(paper, source)
     else:
-        slug, config_name = source_discipline(paper)
+        slugs, config_name = source_disciplines(paper)
     if config_name:
         paper["source"] = config_name
     card = dict(paper)
     paper.pop("source_openalex_id", None)   # a normalizer-only key, not a `papers` column
 
+    if user is not None:
+        # The counter before the paper's rows (lock order), and before db_match: the match decides
+        # the insert-only keys, so no lock wait may sit between it and upsert_paper's own match.
+        bump = conn.cursor()
+        bump.execute(BUMP_SQL, [user])
+        bump.fetchone()
     existing = db_match(conn, paper)
     if existing is None:
         paper["origin"] = "user-library"
@@ -827,8 +851,8 @@ def ingest_record(conn, record: dict, source: str, *, network: bool = True
         # can match a crawled journal article through db_match; that article must not become a book).
         for key in BOOK_COLUMNS:
             paper.pop(key, None)
-    paper_id, inserted = upsert_paper(conn, paper)
-    return (str(paper_id) if paper_id else None), inserted, slug, card
+    paper_id, inserted = upsert_paper(conn, paper, commit=False)
+    return (str(paper_id) if paper_id else None), inserted, slugs, card
 
 
 # ── one row ──────────────────────────────────────────────────────────────────
@@ -972,9 +996,11 @@ def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
     if is_import:
         # db.py's upsert can print a dedup warning naming the record's DOI and arXiv id
         with contextlib.redirect_stdout(io.StringIO()):
-            paper_id, inserted, slug, card = ingest_record(conn, resolved_work, resolved_source, network=network)
+            paper_id, inserted, slugs, card = ingest_record(conn, resolved_work, resolved_source,
+                                                            network=network, user=user)
     else:
-        paper_id, inserted, slug, card = ingest_record(conn, resolved_work, resolved_source, network=network)
+        paper_id, inserted, slugs, card = ingest_record(conn, resolved_work, resolved_source,
+                                                        network=network, user=user)
     if paper_id is None:
         if not title_row:
             cur.execute(BUMP_SQL, [user])
@@ -985,8 +1011,9 @@ def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
         return qid, "closed"
 
     linked_disc = 0
-    if inserted and slug:
-        linked_disc = link_disciplines(cur, paper_id, slug)
+    if inserted:
+        for slug in slugs:
+            linked_disc += link_disciplines(cur, paper_id, slug)
     if not title_row:
         cur.execute(BUMP_SQL, [user])
         v = cur.fetchone()[0]
@@ -995,7 +1022,7 @@ def process_row(conn, *, collections: bool, merged_into: bool, dry_run: bool,
     outcome = link_item(cur, qid, item_id, user, paper_id,
                         collections=collections, merged_into=merged_into, say=say)
     say(f"  [ingest]  queue={qid} paper={paper_id} inserted={inserted} "
-          f"source={resolved_source} discipline={slug or '-'}({linked_disc})")
+          f"source={resolved_source} discipline={','.join(slugs) or '-'}({linked_disc})")
     if inserted:
         _revalidate_after_commit.append((paper_id, bool(is_import)))
     return qid, outcome
@@ -1090,6 +1117,13 @@ def run(conn, *, dry_run: bool = False, limit: int | None = None,
             name = e.__class__.__name__
             # The class name only: a message can carry a row's values (a constraint's DETAIL).
             print(f"  [error]   queue={claimed} {name}")
+            if name == "DeadlockDetected" and getattr(e, "diag", None) is not None:
+                # A deadlock's DETAIL and CONTEXT name processes, transactions, tuples and relations
+                # (ingest-work-fixes: the only diagnosis the public log can carry). An advisory lock's
+                # tag holds hashtext() of the row's DOI or arXiv id, which an import row's log must not
+                # carry, so it is redacted.
+                detail = ADVISORY_TAG.sub("advisory lock [redacted]", e.diag.message_detail or "")
+                print(f"  [error]   queue={claimed} detail={detail!r} context={e.diag.context!r}")
             raised += 1
             if claimed is None:
                 alerts += 1

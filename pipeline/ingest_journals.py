@@ -20,26 +20,15 @@ from journals_config import JOURNALS_BY_DISCIPLINE
 # under the same normalization (ledger task capture-drain-ingest, design item 2). Re-exported
 # under their old names: every existing caller and test keeps working.
 from ingest_work import is_valid_paper, normalize_openalex, reconstruct_abstract  # noqa: F401
+# The link rule moved to ingest_work.py (ledger task ingest-work-fixes) so the capture drain and
+# promote_captured.py apply it too; re-exported here for ingest_crossref.py, the backfill and tests.
+from ingest_work import MULTI_LINK_SLUGS, link_slugs_for  # noqa: F401
 
 PIPELINE_DIR = Path(__file__).resolve().parent
 load_dotenv(dotenv_path=PIPELINE_DIR.parent / ".env.local")
 load_dotenv()  # fallback for .env
 
 OPENALEX_EMAIL = os.environ.get("OPENALEX_EMAIL", "")
-
-# Disciplines whose shared journals link a paper to every one of them (ledger task ingest-multi-discipline-link, owner
-# "가" 2026-11-09): a journal listed under both political science and public policy gives its papers both links. A
-# journal on any other pair of lists (Administrative Science Quarterly, the three finance journals) keeps its first
-# listed discipline until a primary-discipline rule is decided.
-MULTI_LINK_SLUGS = frozenset({"political-science", "public-policy"})
-
-
-def link_slugs_for(slugs: list[str]) -> list[str]:
-    """The disciplines a journal's papers link to, from its listed slugs in config order: every slug when all of them are
-    in MULTI_LINK_SLUGS, otherwise the first only. Journal ingest, Crossref ingest and the backfill all call this."""
-    if slugs and all(s in MULTI_LINK_SLUGS for s in slugs):
-        return list(slugs)
-    return list(slugs[:1])
 
 
 def trigger_revalidation(saved: int) -> None:
