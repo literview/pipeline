@@ -13,7 +13,7 @@ imports this module. Pure: no database, no network.
 """
 import re
 
-RULE_VERSION = "2026-10-30"
+RULE_VERSION = "2026-11-22"
 
 RULES = [
     # corrections and retractions: the notice word opens or closes the title. A research title may
@@ -32,7 +32,10 @@ RULES = [
         r"|^(media|film|exhibition) review\b|^\s*:\s*<i>"
         r"|\bISBN\b|\b\d{2,4}\s?pp\b\.?|\bpp\.\s?\d|\b(hardcover|hardback|paperback|cloth|e-?book)\b[,:]?\s*(\$|£|€|us\$|\d)"
         r"|[$£€]\s?\d+(\.\d\d)?\s*(\(|,|;|\.|$)"
-        r"|\b(university press|routledge|palgrave|edward elgar|polity|bloomsbury|brill|verso|zed books)\b[^.]{0,40}\b(19|20)\d\d\b", re.I)),
+        r"|\b(university press|routledge|palgrave|edward elgar|polity|bloomsbury|brill|verso|zed books)\b[^.]{0,40}\b(19|20)\d\d\b"
+        # "Title. By Author. City: Press, year." (record-kind-book-review-form, 2026-11-22): the year after a
+        # separator keeps out "Comment on (Un)pleasant ... by Bond et al (2020)"
+        r"|\.\s+(edited\s+)?by\s+.+[.,:]\s*(19|20)\d\d\b", re.I)),
     # a supplement deposited as its own record (APA "Supplemental Material for ...", DOI ending
     # .supp; found by aea-appx-pdf-url, 2026-10-30): the parent article is in the corpus
     ("supplement", re.compile(
