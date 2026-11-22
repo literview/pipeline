@@ -1045,13 +1045,18 @@ RECORD_ERROR_SQL = (
     "to_char(last_attempt_at, 'YYYY-MM-DD\"T\"HH24:MI:SSOF'), (doi IS NULL AND arxiv_id IS NULL)")
 
 
-def record_error(conn, qid: str, name: str) -> int:
+def record_error(conn, qid: str, name: str) -> int | None:
     """Record a raising row's attempt in its own transaction; returns the attempts before it. A row
     past FAILED_AFTER_DAYS becomes failed and its card incomplete (not_indexed), BUMP first; a
-    title row's item is never written."""
+    title row's item is never written. Returns None, writing nothing, when the row is gone: it was
+    deleted after the claim's rollback (an account deletion, docs/ledger/deletion-lock-order.md)."""
     cur = conn.cursor()
     cur.execute(RECORD_ERROR_SQL, [name, qid])
-    status, before, item_id, user, stamp, title_row = cur.fetchone()
+    found = cur.fetchone()
+    if found is None:
+        conn.rollback()
+        return None
+    status, before, item_id, user, stamp, title_row = found
     if status == "failed" and not title_row:
         cur.execute(BUMP_SQL, [str(user)])
         v = cur.fetchone()[0]
@@ -1136,7 +1141,8 @@ def run(conn, *, dry_run: bool = False, limit: int | None = None,
                 if dry_run:
                     c2 = conn.cursor()
                     c2.execute("SELECT attempts FROM library_capture_queue WHERE id = %s", [claimed])
-                    before = int(c2.fetchone()[0])
+                    got = c2.fetchone()
+                    before = int(got[0]) if got is not None else None
                     conn.rollback()
                 else:
                     before = record_error(conn, claimed, name)
@@ -1146,6 +1152,10 @@ def run(conn, *, dry_run: bool = False, limit: int | None = None,
                       f"{e2.__class__.__name__}")
                 alerts += 1
                 break
+            if before is None:
+                # The row was deleted after its claim (an account deletion): nothing to record, no alert.
+                print(f"  [gone]    queue={claimed} deleted before its attempt was recorded")
+                continue
             if before == 0:
                 alerts += 1              # the row's first failure: the run exits non-zero
             continue
