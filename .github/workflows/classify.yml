@@ -26,7 +26,7 @@ concurrency:
 jobs:
   classify:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout repository
@@ -51,6 +51,19 @@ jobs:
           # CUDA payload was never anything but ballast. See LESSONS.md L012.
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements-classify.txt
+
+      # Taste profile (LiterView ledger task taste-pipeline): embed navigable papers that have no
+      # paper_embeddings row yet, newest first, at most embed_limit (5000 on the schedule). Prints a
+      # notice and exits 0 while migration 060 is absent. A failure warns and never fails the job
+      # (L4): the next run picks up whatever this one left, because the selection is "no row yet".
+      # It runs before the classifiers: on 2026-11-23 they reached the job timeout and this step never ran.
+      - name: Embed new papers (taste)
+        id: embed
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        working-directory: pipeline
+        run: python embed_new_papers.py --limit ${{ inputs.embed_limit || '5000' }}
+        continue-on-error: true
 
       # The checkpoint lives in the private repo literview/models, which this
       # repo's default GITHUB_TOKEN cannot read. The token is minted per run by the
@@ -103,19 +116,6 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         working-directory: pipeline
         run: python classify_new_papers.py ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
-        continue-on-error: true
-
-      # Taste profile (LiterView ledger task taste-pipeline): embed navigable papers that have no
-      # paper_embeddings row yet, newest first, at most embed_limit (5000 on the schedule). Prints a
-      # notice and exits 0 while migration 060 is absent. A failure warns and never fails the job
-      # (L4): the next run picks up whatever this one left, because the selection is "no row yet".
-      - name: Embed new papers (taste)
-        id: embed
-        if: always()
-        env:
-          DATABASE_URL: ${{ secrets.DATABASE_URL }}
-        working-directory: pipeline
-        run: python embed_new_papers.py --limit ${{ inputs.embed_limit || '5000' }}
         continue-on-error: true
 
       - name: Warn if taste embedding failed (email)
