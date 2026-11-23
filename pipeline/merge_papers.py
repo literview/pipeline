@@ -467,7 +467,8 @@ def _restamp_ink(cur, user: str, from_item, to_item, max_version: int | None = N
 
 def _merge_library_user(cur, user: str, loser: str, winner: str, *,
                         collections: bool = False, merged_into: bool = False,
-                        page_edits: bool | None = None, ink: bool | None = None) -> dict[str, int]:
+                        page_edits: bool | None = None, ink: bool | None = None,
+                        meta_override: bool | None = None) -> dict[str, int]:
     """One user's library rows, loser paper -> winner paper. See module header for why this
     cannot use the generic delete-colliding policy.
 
@@ -484,12 +485,27 @@ def _merge_library_user(cur, user: str, loser: str, winner: str, *,
     cur.execute(f"SELECT {cols} FROM library_items WHERE user_id = %s AND paper_id = %s", [user, winner])
     w_row = cur.fetchone()
     return _fold_library_rows(cur, user, l_row, w_row, winner, v, collections=collections,
-                              merged_into=merged_into, page_edits=page_edits, ink=ink)
+                              merged_into=merged_into, page_edits=page_edits, ink=ink,
+                              meta_override=meta_override)
+
+
+def fold_overrides(w_override, l_override, w_live: bool):
+    """The survivor's `meta_override` after case (4) folds the loser into it (ledger task
+    f07-override-server; docs/library/F07_DESIGN.md 4.2). A live survivor keeps its own entry per
+    field and takes the fields it lacks from the loser's entries. A survivor that is a tombstone
+    revived by the live loser takes the loser's entries whole and drops its own, by the rule the
+    fold applies to its other fields: a deleted row's content never comes back (orchestrator
+    ruling 3, 2026-11-23). An empty result is None, the column's NULL."""
+    w = w_override if isinstance(w_override, dict) else {}
+    l = l_override if isinstance(l_override, dict) else {}
+    merged = {**l, **w} if w_live else dict(l)
+    return merged or None
 
 
 def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None, v: int, *,
                        collections: bool = False, merged_into: bool = False,
-                       page_edits: bool | None = None, ink: bool | None = None) -> dict[str, int]:
+                       page_edits: bool | None = None, ink: bool | None = None,
+                       meta_override: bool | None = None) -> dict[str, int]:
     """Steps (2)-(4e) of the per-user library merge, on rows the caller has already read AFTER
     taking the user's counter lock (BUMP_SQL). Two callers: `_merge_library_user` (corpus merge —
     loser and winner rows are both paper-backed) and `pipeline/drain_capture_queue.py` (W-E3
@@ -499,7 +515,9 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
     `l_row` / `w_row` are `(id, deleted_at IS NULL, starred, read_status, memo, added_at,
     ext_meta)` tuples (`w_row` may be None); `winner_paper_id` is the `papers.id` the surviving
     row points at; `v` is the already-bumped version. `page_edits` is the 052 capability flag
-    (None = probe it in (4c)); `ink` says whether `ink_ops` exists (None = probe it in case (4)).
+    (None = probe it in (4c)); `ink` says whether `ink_ops` exists (None = probe it in case (4));
+    `meta_override` says whether `library_items.meta_override` exists (migration 109; None = probe
+    it in case (4)), and the drain passes none of the three.
     A surviving row that points at a corpus
     paper never carries `ext_meta` (039: NULL when paper_id is set), so step (3) clears it on the
     re-point and step (4) never copies an external row's `ext_meta` onto the winner. Both are
@@ -510,7 +528,8 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
            "collection_items_revived": 0, "resurrect_children_restamped": 0,
            "import_links_moved": 0, "source_records_moved": 0, "source_records_dropped": 0,
            "citekeys_moved": 0, "citekeys_dropped": 0, "server_fetches_moved": 0,
-           "ink_moved": 0, "ink_restamped": 0, "annotations_kept": 0, "kept_file_mismatch": 0}
+           "ink_moved": 0, "ink_restamped": 0, "annotations_kept": 0, "kept_file_mismatch": 0,
+           "overrides_folded": 0}
     l_id, l_live, l_star, l_read, l_memo, l_added, l_ext = l_row
     w = w_row
 
@@ -520,9 +539,10 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
     # tombstone it has seen, and server-side tombstone GC will cascade them away at 180d.
     # Releasing paper_id (nullable) is all that is needed: it clears the RESTRICT FK so the
     # loser `papers` row can be deleted, and NULLs are distinct under UNIQUE(user_id, paper_id).
+    # A row without a paper may hold no meta_override (109's CHECK), so the tombstone clears it.
     if not l_live:
-        cur.execute("UPDATE library_items SET paper_id = NULL, version = %s, updated_at = now() "
-                    "WHERE id = %s", [v, l_id])
+        cur.execute("UPDATE library_items SET paper_id = NULL, meta_override = NULL, version = %s, "
+                    "updated_at = now() WHERE id = %s", [v, l_id])
         out["tombstoned"] += 1
         return out
 
@@ -556,6 +576,24 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
                           added_at = %s, deleted_at = NULL, version = %s, updated_at = now()
                     WHERE id = %s""", [star, read, memo, ext, added, v, w_id])
     out["field_merged"] += 1
+
+    # The users' overrides (migration 109, ledger task f07-override-server): the survivor takes the
+    # merge of the two items' entries (`fold_overrides`), read by item id here so the row tuple the
+    # drain passes stays as it is. Before (4d), which clears the loser's. The user's counter lock
+    # (taken by both callers before the fold) keeps every other library writer out meanwhile, and the
+    # survivor's version was set to v just above.
+    if meta_override is None:
+        meta_override = has_column(cur, "library_items", "meta_override")
+    if meta_override:
+        cur.execute("SELECT id::text, meta_override FROM library_items WHERE id = ANY(%s::uuid[])",
+                    [[str(w_id), str(l_id)]])
+        held = {str(i).lower(): mo for i, mo in cur.fetchall()}
+        w_mo, l_mo = held.get(str(w_id).lower()), held.get(str(l_id).lower())
+        merged = fold_overrides(w_mo, l_mo, bool(w_live))
+        if merged != (w_mo or None):
+            cur.execute("UPDATE library_items SET meta_override = %s::jsonb WHERE id = %s",
+                        [None if merged is None else json.dumps(merged), w_id])
+            out["overrides_folded"] += 1
 
     # MERGE-ANNOT-1: K and the loser's same-PDF annotations, planned from the rows as they are
     # before any annotation or file moves (the counter lock taken above keeps them so).
@@ -786,13 +824,15 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
     # one instead of letting it die silently against a dead row. Stamped only in this path: the
     # (2) branch's tombstone is the USER's own deletion, and a pending op on it must die, not
     # redirect.
+    #
+    # Both also clear meta_override (109's CHECK); the survivor already took the loser's entries above.
     if merged_into:
-        cur.execute("UPDATE library_items SET deleted_at = now(), paper_id = NULL, "
+        cur.execute("UPDATE library_items SET deleted_at = now(), paper_id = NULL, meta_override = NULL, "
                     "merged_into = %s, version = %s, updated_at = now() WHERE id = %s",
                     [w_id, v, l_id])
     else:
-        cur.execute("UPDATE library_items SET deleted_at = now(), paper_id = NULL, version = %s, "
-                    "updated_at = now() WHERE id = %s", [v, l_id])
+        cur.execute("UPDATE library_items SET deleted_at = now(), paper_id = NULL, meta_override = NULL, "
+                    "version = %s, updated_at = now() WHERE id = %s", [v, l_id])
     out["tombstoned"] += 1
     return out
 
@@ -891,6 +931,7 @@ def merge_library_items(cur, loser: str, winner: str) -> dict[str, int]:
     merged_into = has_column(cur, "library_items", "merged_into")
     page_edits = has_column(cur, "reading_state", "page_edits")   # 052
     ink = has_table(cur, "public.ink_ops")                        # ink-migration
+    meta_override = has_column(cur, "library_items", "meta_override")   # 109 (f07-override-server)
 
     cur.execute("SELECT DISTINCT user_id FROM library_items WHERE paper_id = %s ORDER BY user_id",
                 [loser])
@@ -898,7 +939,8 @@ def merge_library_items(cur, loser: str, winner: str) -> dict[str, int]:
     total: dict[str, int] = {"users": len(users)}
     for u in users:
         merged = _merge_library_user(cur, u, loser, winner, collections=collections,
-                                     merged_into=merged_into, page_edits=page_edits, ink=ink)
+                                     merged_into=merged_into, page_edits=page_edits, ink=ink,
+                                     meta_override=meta_override)
         for k, n in merged.items():
             total[k] = total.get(k, 0) + n
     return total
