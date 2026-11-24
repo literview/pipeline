@@ -1,11 +1,12 @@
-"""embed_new_papers.py -- embed navigable papers that have no paper_embeddings row yet
-(ledger task `taste-pipeline`, item 2; design Section 7).
+"""embed_new_papers.py -- embed vetted core papers that have no paper_embeddings row yet
+(ledger task `taste-pipeline`, item 2; design Section 7; widened by `vector-coverage-widen`).
 
-Runs daily in academic-crawler's classify.yml after the classifiers, and as the backfill through
-`workflow_dispatch` with `embed_limit`. The selection is "navigable, no row for MODEL_ID yet",
+Runs daily in academic-crawler's classify.yml before the classifiers, and as the backfill through
+`workflow_dispatch` with `embed_limit`. The selection is "vetted and core, no row for MODEL_ID yet",
 newest `created_at` first, so the step is idempotent and resumable: a chunk that dies halfway
 leaves its committed 500-row batches in place, and a merge winner without a vector is picked up
-the next day.
+the next day. It is wider than te.navigable_paper so that a paper outside the in-scope disciplines
+can be a feed reference; the card pool and the negatives keep navigable_paper.
 
   python embed_new_papers.py                 # at most 5,000 papers
   python embed_new_papers.py --limit 500
@@ -31,7 +32,7 @@ DEFAULT_LIMIT = 5000
 NOTICE = "paper_embeddings absent: migration 060 not applied; skipping"
 
 UNEMBEDDED = f"""FROM papers p
- WHERE {te.navigable_paper('p')}
+ WHERE p.vetted AND p.corpus_tier = 'core'
    AND NOT EXISTS (SELECT 1 FROM paper_embeddings e WHERE e.paper_id = p.id AND e.model_id = %s)"""
 SELECT_SQL = f"""SELECT p.id::text AS id, p.title, p.abstract {UNEMBEDDED}
  ORDER BY p.created_at DESC, p.id

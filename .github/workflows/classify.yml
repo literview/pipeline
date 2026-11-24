@@ -52,7 +52,7 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install -r requirements-classify.txt
 
-      # Taste profile (LiterView ledger task taste-pipeline): embed navigable papers that have no
+      # Taste profile (LiterView ledger task taste-pipeline): embed vetted core papers that have no
       # paper_embeddings row yet, newest first, at most embed_limit (5000 on the schedule). Prints a
       # notice and exits 0 while migration 060 is absent. A failure warns and never fails the job
       # (L4): the next run picks up whatever this one left, because the selection is "no row yet".
