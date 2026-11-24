@@ -527,6 +527,7 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
            "collection_items_folded": 0, "collection_items_dropped": 0,
            "collection_items_revived": 0, "resurrect_children_restamped": 0,
            "import_links_moved": 0, "source_records_moved": 0, "source_records_dropped": 0,
+           "source_records_composed": 0, "raw_dropped": 0, "zotero_skipped": 0,
            "citekeys_moved": 0, "citekeys_dropped": 0, "server_fetches_moved": 0,
            "ink_moved": 0, "ink_restamped": 0, "annotations_kept": 0, "kept_file_mismatch": 0,
            "overrides_folded": 0}
@@ -852,6 +853,102 @@ def loser_citekey_wins(w_key, l_key) -> bool:
     return False
 
 
+# Pass (4g)'s record rule (ledger task drain-fold-attachments): when both items hold a record of one source, the
+# record kept keeps the deleted one's attachments too. A port of composeSourceRecord and attachmentKey
+# (lib/library/import-ui/multi-file.ts) and of the `raw` drop of sourceRecordFor (lib/library/import-commit.ts), so the
+# crawler's copy of this file stays one file. The vectors both languages read:
+# lib/library/import-ui/compose-source-record.vectors.json.
+SOURCE_RECORD_BYTES_MAX = 200 * 1024   # import-commit.ts RECORD_BYTES_MAX
+# A Zotero record is not composed (C5): the Zotero pull rebuilds each parent's children from the record its link
+# reaches, and one record under two Zotero links already files a child under the wrong parent
+# (lib/library/zotero/pull.unit.test.ts, the C5 tests); the fold keeps today's behaviour for it and counts it.
+ZOTERO_FOLD_COMPOSES = False
+
+
+def _non_empty(v):
+    return v if isinstance(v, str) and v != "" else None
+
+
+def _js_truthy(v) -> bool:
+    """JavaScript truthiness of a JSON value (an empty list or object is truthy there)."""
+    if v is None or v is False:
+        return False
+    if isinstance(v, (int, float)) and not isinstance(v, bool):
+        return v != 0
+    if isinstance(v, str):
+        return v != ""
+    return True
+
+
+def attachment_key(a) -> str | None:
+    """An attachment's identity in a union: a non-empty gdriveId, else zoteroKey, else path, each prefixed with its
+    field name; else the filename with a numeric sizeBytes; None when it has none of these or is not an object."""
+    if not isinstance(a, dict):
+        return None
+    for field in ("gdriveId", "zoteroKey", "path"):
+        v = _non_empty(a.get(field))
+        if v is not None:
+            return f"{field}:{v}"
+    filename = _non_empty(a.get("filename"))
+    size = a.get("sizeBytes")
+    if filename is not None and isinstance(size, (int, float)) and not isinstance(size, bool):
+        if isinstance(size, float) and size.is_integer():
+            size = int(size)   # JSON 1.0 and 1 are one number in JavaScript
+        return "filename:" + json.dumps([filename, size], separators=(",", ":"), ensure_ascii=False)
+    return None
+
+
+def compose_source_record(entries: list) -> dict:
+    """The first record, whose attachments are its own followed by each later record's attachments whose key is not
+    yet present, in order; an attachment with no key (a non-object entry included) is always kept. The first
+    attachment marked `primary` keeps the mark and any later one loses it. A record whose `attachments` is not a list
+    adds nothing, and a first record without a list is returned as it is (a copy), as it is when nothing changes."""
+    first = entries[0]
+    if not isinstance(first.get("attachments"), list):
+        return dict(first)
+    attachments: list = []
+    seen: set[str] = set()
+    primary = False
+    changed = False
+    for i, r in enumerate(entries):
+        atts = r.get("attachments") if isinstance(r, dict) else None
+        for a in atts if isinstance(atts, list) else []:
+            k = attachment_key(a)
+            if i > 0 and k is not None and k in seen:
+                continue
+            if k is not None:
+                seen.add(k)
+            if i > 0:
+                changed = True
+            if isinstance(a, dict) and _js_truthy(a.get("primary")):
+                if primary:
+                    attachments.append({x: y for x, y in a.items() if x != "primary"})
+                    changed = True
+                    continue
+                primary = True
+            attachments.append(a)
+    return {**first, "attachments": attachments} if changed else dict(first)
+
+
+def _record_bytes(record) -> int:
+    return len(json.dumps(record, separators=(",", ":"), ensure_ascii=False).encode("utf-8"))
+
+
+def fold_source_record(base, other) -> tuple[list | None, bool, int]:
+    """Pass (4g)'s write on the kept record `base` when `other` is deleted: (the attachments to write, whether `raw`
+    goes, the number of attachments added). Nothing is written, (None, False, 0), unless `other` adds an attachment;
+    `raw` goes only then, when the record with the new attachments exceeds SOURCE_RECORD_BYTES_MAX as compact UTF-8
+    JSON."""
+    if not isinstance(base, dict) or not isinstance(base.get("attachments"), list):
+        return None, False, 0
+    composed = compose_source_record([base, other if isinstance(other, dict) else {}])
+    added = len(composed["attachments"]) - len(base["attachments"])
+    if added <= 0:
+        return None, False, 0
+    drop = "raw" in base and _record_bytes({**base, "attachments": composed["attachments"]}) > SOURCE_RECORD_BYTES_MAX
+    return composed["attachments"], drop, added
+
+
 def _fold_server_children(cur, l_id, w_id, out: dict[str, int]) -> None:
     """Passes (4f)-(4i) of the case-(4) fold: the loser item `l_id` folds into `w_id`
     (docs/ledger/lp3-import-tables.md, change 2). Counts go into `out`."""
@@ -866,25 +963,54 @@ def _fold_server_children(cur, l_id, w_id, out: dict[str, int]) -> None:
     # (4g) library_item_source_records, PK (library_item_id, source): per source, the later
     # imported_at survives on the winner (a tie keeps the winner's). The losing row is deleted first,
     # because the primary key rejects the re-point while the winner's row still holds the source.
+    # The surviving record keeps the deleted one's attachments (`fold_source_record`, ledger task
+    # drain-fold-attachments): only its `attachments` key is written, and its `raw` goes only when an
+    # attachment was added and the record then exceeds the cap; `updated_at` stays (no trigger moves it).
+    # Both rows are locked per source in ascending item order, after the user's counter lock that the
+    # callers take first, as every other writer of these rows does.
     if has_table(cur, "public.library_item_source_records"):
-        cur.execute("SELECT source, imported_at FROM library_item_source_records "
+        cur.execute("SELECT source FROM library_item_source_records "
                     "WHERE library_item_id = %s ORDER BY source", [l_id])
-        for source, l_at in cur.fetchall():
-            cur.execute("SELECT imported_at FROM library_item_source_records "
-                        "WHERE library_item_id = %s AND source = %s", [w_id, source])
-            row = cur.fetchone()
-            if row is not None and not (l_at > row[0]):
-                cur.execute("DELETE FROM library_item_source_records "
-                            "WHERE library_item_id = %s AND source = %s", [l_id, source])
-                out["source_records_dropped"] += cur.rowcount
+        for (source,) in cur.fetchall():
+            cur.execute("SELECT library_item_id::text, record, imported_at FROM library_item_source_records "
+                        "WHERE library_item_id = ANY(%s::uuid[]) AND source = %s "
+                        "ORDER BY library_item_id FOR UPDATE", [[str(l_id), str(w_id)], source])
+            held = {str(i).lower(): (rec, at) for i, rec, at in cur.fetchall()}
+            l_held, w_held = held.get(str(l_id).lower()), held.get(str(w_id).lower())
+            if l_held is None:
                 continue
-            if row is not None:
-                cur.execute("DELETE FROM library_item_source_records "
-                            "WHERE library_item_id = %s AND source = %s", [w_id, source])
-                out["source_records_dropped"] += cur.rowcount
-            cur.execute("UPDATE library_item_source_records SET library_item_id = %s "
-                        "WHERE library_item_id = %s AND source = %s", [w_id, l_id, source])
-            out["source_records_moved"] += cur.rowcount
+            if w_held is None:
+                cur.execute("UPDATE library_item_source_records SET library_item_id = %s "
+                            "WHERE library_item_id = %s AND source = %s", [w_id, l_id, source])
+                out["source_records_moved"] += cur.rowcount
+                continue
+            l_later = l_held[1] > w_held[1]
+            base, other = (l_held[0], w_held[0]) if l_later else (w_held[0], l_held[0])
+            attachments, drop_raw = None, False
+            if source == "zotero" and not ZOTERO_FOLD_COMPOSES:
+                out["zotero_skipped"] += 1
+            else:
+                attachments, drop_raw, _ = fold_source_record(base, other)
+            cur.execute("DELETE FROM library_item_source_records "
+                        "WHERE library_item_id = %s AND source = %s", [w_id if l_later else l_id, source])
+            out["source_records_dropped"] += cur.rowcount
+            compose = ("record = jsonb_set(record, '{attachments}', %s::jsonb)"
+                       + (" - 'raw'" if drop_raw else "")) if attachments is not None else None
+            if l_later:
+                if compose:
+                    cur.execute(f"UPDATE library_item_source_records SET library_item_id = %s, {compose} "
+                                "WHERE library_item_id = %s AND source = %s",
+                                [w_id, json.dumps(attachments), l_id, source])
+                else:
+                    cur.execute("UPDATE library_item_source_records SET library_item_id = %s "
+                                "WHERE library_item_id = %s AND source = %s", [w_id, l_id, source])
+                out["source_records_moved"] += cur.rowcount
+            elif compose:
+                cur.execute(f"UPDATE library_item_source_records SET {compose} "
+                            "WHERE library_item_id = %s AND source = %s", [json.dumps(attachments), w_id, source])
+            if compose:
+                out["source_records_composed"] += 1
+                out["raw_dropped"] += 1 if drop_raw else 0
 
     # (4h) library_item_citekeys, PK library_item_id: one key survives (`loser_citekey_wins`). The
     # losing key is deleted first. A re-pointed key cannot collide with UNIQUE (user_id, citekey):
