@@ -8,6 +8,9 @@ Usage:
   python classify_new_papers.py                  # classify all untagged papers
   python classify_new_papers.py --limit 500      # process at most N papers
   python classify_new_papers.py --threshold 0.35 # stricter embedding threshold
+  python classify_new_papers.py --abstract-after-days 7
+      # papers without an abstract, plus papers with one still untagged 7 days after created_at
+      # (the student classifier labels papers with an abstract; this waits for it first)
 """
 import os
 import re
@@ -38,7 +41,25 @@ def get_tags_map(conn) -> dict:
     return {t["name"]: t["id"] for t in rows}
 
 
-def get_unclassified_papers(conn, limit: int = None) -> list:
+def in_scope_sql(abstract_after_days: int = None) -> str:
+    # Scope gate (A5): only fetch in-scope papers (linked to an in-scope discipline)
+    # so the fallback classifier never tags out-of-scope arXiv/physics papers.
+    sql = """
+        SELECT p.id, p.title, p.source, p.abstract FROM papers p
+        WHERE p.corpus_tier = 'core'
+          AND EXISTS (SELECT 1 FROM paper_disciplines pd JOIN disciplines d
+                      ON d.id = pd.discipline_id
+                      WHERE pd.paper_id = p.id AND d.in_scope)
+    """
+    if abstract_after_days is not None:
+        # A paper with an abstract that this fallback labels is never relabelled by the student,
+        # so such a paper is taken only once it is still untagged N days after created_at.
+        sql += (f"      AND (COALESCE(LENGTH(TRIM(p.abstract)), 0) < 1"
+                f" OR p.created_at < now() - make_interval(days => {int(abstract_after_days)}))\n")
+    return sql
+
+
+def get_unclassified_papers(conn, limit: int = None, abstract_after_days: int = None) -> list:
     """
     Fetch papers that have no paper_tags rows at all.
     """
@@ -48,15 +69,7 @@ def get_unclassified_papers(conn, limit: int = None) -> list:
     print(f"  {len(tagged_ids)} papers already have tags")
 
     print("[Classify] Fetching all papers...")
-    # Scope gate (A5): only fetch in-scope papers (linked to an in-scope discipline)
-    # so the fallback classifier never tags out-of-scope arXiv/physics papers.
-    papers_rows = execute(conn, """
-        SELECT p.id, p.title, p.source, p.abstract FROM papers p
-        WHERE p.corpus_tier = 'core'
-          AND EXISTS (SELECT 1 FROM paper_disciplines pd JOIN disciplines d
-                      ON d.id = pd.discipline_id
-                      WHERE pd.paper_id = p.id AND d.in_scope)
-    """)
+    papers_rows = execute(conn, in_scope_sql(abstract_after_days))
     papers = [p for p in papers_rows if p["id"] not in tagged_ids]
 
     if limit:
@@ -153,17 +166,27 @@ def flush_batch(conn, batch: list):
     return conn
 
 
-def main():
+def parse_args(argv: list) -> tuple:
+    """(threshold, limit, abstract_after_days) from argv, the program name included."""
     threshold = DEFAULT_THRESHOLD
     limit = None
-    for i, arg in enumerate(sys.argv[1:], 1):
-        if arg == "--threshold" and i < len(sys.argv) - 1:
-            threshold = float(sys.argv[i + 1])
-        elif arg == "--limit" and i < len(sys.argv) - 1:
-            limit = int(sys.argv[i + 1])
+    abstract_after_days = None
+    for i, arg in enumerate(argv[1:], 1):
+        if arg == "--threshold" and i < len(argv) - 1:
+            threshold = float(argv[i + 1])
+        elif arg == "--limit" and i < len(argv) - 1:
+            limit = int(argv[i + 1])
+        elif arg == "--abstract-after-days" and i < len(argv) - 1:
+            abstract_after_days = int(argv[i + 1])
+    return threshold, limit, abstract_after_days
+
+
+def main():
+    threshold, limit, abstract_after_days = parse_args(sys.argv)
 
     print(f"[Classify] Starting at {datetime.now().isoformat()}")
-    print(f"  Threshold: {threshold}  |  Limit: {limit or 'all'}")
+    print(f"  Threshold: {threshold}  |  Limit: {limit or 'all'}  |  "
+          f"Abstract after days: {abstract_after_days if abstract_after_days is not None else 'any'}")
 
     conn = get_client()
 
@@ -176,7 +199,7 @@ def main():
         from sentence_transformers import SentenceTransformer
         model = SentenceTransformer(EMBEDDING_MODEL)
 
-        papers = get_unclassified_papers(conn, limit)
+        papers = get_unclassified_papers(conn, limit, abstract_after_days)
         if not papers:
             print("[Classify] No unclassified papers found. Done.")
             return

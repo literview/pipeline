@@ -32,6 +32,10 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # The student step's time budget counts from here, so the job's 60 minutes cover every step.
+      - name: Record job start
+        run: echo "JOB_T0=$(date +%s)" >> "$GITHUB_ENV"
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -102,21 +106,51 @@ jobs:
           mkdir -p pipeline/student_prod_v2
           gh release download student-v2 --repo literview/models -D pipeline/student_prod_v2 --clobber
 
+      # The student writes and commits per chunk of 128 papers, newest first, and stops before a
+      # chunk that would pass its budget B: 48 minutes from the job's start, leaving 12 of the job's
+      # 60 for the fallback and the warnings. `timeout` is the backstop (TERM at B+4 minutes, KILL 30 s
+      # later); a step-level timeout-minutes counts from the step's start and did not stop the
+      # process on 2026-11-24. Committed chunks stay when it fires. The script prints
+      # [student] remaining R and [student] oldest_hours H and emits both as step outputs.
       - name: Classify new papers (student, ModernBERT)
         id: student
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         working-directory: pipeline
-        run: python classify_student.py --ckpt student_prod_v2 ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
+        run: |
+          B=$(( 48 - ($(date +%s) - JOB_T0) / 60 ))
+          timeout -k 30 $(( (B>0?B:0) + 4 ))m python classify_student.py --ckpt student_prod_v2 --max-minutes "$B" ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
         continue-on-error: true
 
+      # --abstract-after-days 7: a paper with an abstract that this fallback labels is never
+      # relabelled by the student, so the fallback waits 7 days for the student first. It takes
+      # every untagged paper without an abstract, and a paper with one only when it is still
+      # untagged 7 days after created_at (the safety net for a student that keeps failing).
       - name: Classify remaining (keyword + embedding fallback for no-abstract)
         if: always()
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
         working-directory: pipeline
-        run: python classify_new_papers.py ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
+        run: python classify_new_papers.py --abstract-after-days 7 ${{ inputs.limit && format('--limit {0}', inputs.limit) || '' }}
         continue-on-error: true
+
+      # After a bulk day a backlog is expected and clears in a few runs, so the count is an
+      # annotation; the email below fires only when the backlog's oldest paper waits past 72 hours.
+      - name: Report remaining backlog
+        if: ${{ always() && steps.student.outputs.remaining != '' && steps.student.outputs.remaining != '0' }}
+        run: |
+          echo "::warning::student classifier left ${{ steps.student.outputs.remaining }} papers with an abstract unlabelled (oldest ${{ steps.student.outputs.oldest_hours }} hours); the next run continues newest first"
+
+      - name: Warn if the unlabelled backlog is older than 72 hours (email)
+        if: ${{ always() && steps.student.outputs.oldest_hours > 72 }}
+        env:
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+          ALERT_FROM: ${{ secrets.ALERT_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+        run: |
+          python3 pipeline/alert_email.py \
+            --title "LiterView student classifier backlog older than 72 hours" \
+            --body "classify.yml: the student classifier left ${{ steps.student.outputs.remaining }} papers with an abstract unlabelled, the oldest created ${{ steps.student.outputs.oldest_hours }} hours ago. Until they are labelled they are absent from subfield and discipline feeds; at 7 days the fallback labels them with keyword or embedding tags. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
       - name: Warn if taste embedding failed (email)
         if: ${{ always() && steps.embed.outcome == 'failure' }}
@@ -143,13 +177,25 @@ jobs:
             --title "LiterView student classifier FELL BACK to keyword" \
             --body "classify.yml: the student step failed and the keyword/embedding fallback ran instead, so today's labels are the weaker kind. Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
 
+  # A separate job, because a step inside `classify` cannot see that job hit its timeout: on a
+  # cancel, failure() is false there and the run ended silently (2026-11-24). This job reads the
+  # job's result instead, `failure` or `cancelled`. alert_email.py imports only the standard library,
+  # so the runner's python3 runs it without setup-python.
+  alert:
+    needs: classify
+    if: ${{ always() && needs.classify.result != 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Notify on failure (email)
-        if: failure()
         env:
           GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
           ALERT_FROM: ${{ secrets.ALERT_FROM }}
           ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
         run: |
           python3 pipeline/alert_email.py \
-            --title "[URGENT] LiterView classify cron FAILED" \
-            --body "classify.yml failed (checkpoint download, DB, or the classifier itself). Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            --title "[URGENT] LiterView classify run ${{ needs.classify.result }}" \
+            --body "classify.yml: the classify job ended ${{ needs.classify.result }} (job timeout, checkpoint download, DB, or the classifier itself). Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
