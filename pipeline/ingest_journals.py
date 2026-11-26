@@ -30,6 +30,20 @@ load_dotenv()  # fallback for .env
 
 OPENALEX_EMAIL = os.environ.get("OPENALEX_EMAIL", "")
 
+# OpenAlex refuses cursor paging past page 1 without an API key (401 "API key required for cursor paging", measured
+# 2026-11-22 and 2026-11-26), while `page=` paging works without one up to the first 10,000 results of a query
+# (ledger task pipeline-diag-1126).
+PAGE_PAGING_CAP = 10_000
+
+
+def _api_key() -> str | None:
+    """OPENALEX_API_KEY, read at call time; an empty value (an Actions secret that is not set) counts as no key."""
+    return os.environ.get("OPENALEX_API_KEY") or None
+
+
+class PagingCapError(Exception):
+    """Keyless `page=` paging reached OpenAlex's 10,000-result limit before the query's last result."""
+
 
 def trigger_revalidation(saved: int) -> None:
     """Bust the ISR cache for feed pages that depend on newly-ingested papers.
@@ -111,7 +125,9 @@ def fetch_papers_by_sources(
     """
     Fetch papers from multiple sources via OpenAlex within [from_date, to_date].
     Uses OR filter to batch all source IDs for a discipline into one query.
-    Cursor pagination (OpenAlex page-based capped at 10k).
+    With OPENALEX_API_KEY set, the key goes on every request and the pages are read by cursor. Without it, the pages
+    are read by `page=`, which OpenAlex serves only up to the first PAGE_PAGING_CAP results: a query with more raises
+    PartialFetchError (cause PagingCapError) after reading them, never a silent stop.
     Raises PartialFetchError, carrying the papers already read, when a page still fails after its retries.
     """
     papers = []
@@ -132,12 +148,22 @@ def fetch_papers_by_sources(
     }
     if OPENALEX_EMAIL:
         params["mailto"] = OPENALEX_EMAIL
+    key = _api_key()
+    if key:
+        params["api_key"] = key
 
     cursor = "*"
     page = 0
-    while cursor and len(papers) < max_papers:
-        params["cursor"] = cursor
+    while len(papers) < max_papers:
         page += 1
+        if key:
+            params["cursor"] = cursor
+        else:
+            if page * per_page > PAGE_PAGING_CAP:
+                raise PartialFetchError(papers, page, PagingCapError(
+                    f"keyless page paging stops at the first {PAGE_PAGING_CAP:,} results; this query has more. "
+                    f"Set OPENALEX_API_KEY to read by cursor"))
+            params["page"] = page
         try:
             data = _get_page(url, params)
         except Exception as e:
@@ -152,7 +178,15 @@ def fetch_papers_by_sources(
             if paper:
                 papers.append(paper)
 
-        cursor = data.get("meta", {}).get("next_cursor")
+        meta = data.get("meta", {})
+        if key:
+            cursor = meta.get("next_cursor")
+            if not cursor:
+                break
+        else:
+            count = meta.get("count")
+            if isinstance(count, int) and page * per_page >= count:
+                break
         time.sleep(0.1)
 
     return papers
