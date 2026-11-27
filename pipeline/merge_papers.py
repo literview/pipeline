@@ -110,11 +110,17 @@ ORPHANS_BY_DESIGN: set[str] = {"taste_negatives"}
 # `ink_ops` (docs/library/INK_V0_DESIGN.md section 1, ledger task ink-merge-children) joined before
 # the table exists, so that creating it stops no merge: pass (4j) moves the loser's ink to the winner
 # and the resurrect re-stamp (4r) has an ink arm, both guarded by table existence.
+#
+# Migration 111's `library_capture_ids` and `get_pdf_attach_claims` (docs/ledger/gp-migration-a.md, amendment
+# A1) joined before the tables exist, in the same way: pass (4k) re-points the loser's capture ids to the
+# winner, so a replayed capture id answers the item the user keeps; an attach claim is counted and left on
+# the loser, whose attach run finds it tombstoned and deletes it (docs/ledger/gp-plan.md). Both are guarded
+# by table existence. lib/library/item-merge.ts holds the same list and passes.
 KNOWN_LIBRARY_CHILDREN: set[str] = {"annotations", "user_paper_files", "reading_state",
                                     "library_collection_items", "library_capture_queue",
                                     "library_server_fetches", "library_import_links",
                                     "library_item_source_records", "library_item_citekeys",
-                                    "ink_ops"}
+                                    "ink_ops", "library_capture_ids", "get_pdf_attach_claims"}
 
 # A re-stamp gives ink rows versions in chunks of at most this much ink weight (OD-8), each
 # chunk at its own counter bump after the statement's own version (INK_V0_DESIGN.md section 1,
@@ -530,7 +536,7 @@ def _fold_library_rows(cur, user: str, l_row, w_row, winner_paper_id: str | None
            "source_records_composed": 0, "raw_dropped": 0, "zotero_skipped": 0,
            "citekeys_moved": 0, "citekeys_dropped": 0, "server_fetches_moved": 0,
            "ink_moved": 0, "ink_restamped": 0, "annotations_kept": 0, "kept_file_mismatch": 0,
-           "overrides_folded": 0}
+           "overrides_folded": 0, "capture_ids_moved": 0, "attach_claims_left": 0}
     l_id, l_live, l_star, l_read, l_memo, l_added, l_ext = l_row
     w = w_row
 
@@ -950,7 +956,7 @@ def fold_source_record(base, other) -> tuple[list | None, bool, int]:
 
 
 def _fold_server_children(cur, l_id, w_id, out: dict[str, int]) -> None:
-    """Passes (4f)-(4i) of the case-(4) fold: the loser item `l_id` folds into `w_id`
+    """Passes (4f)-(4i) and (4k) of the case-(4) fold: the loser item `l_id` folds into `w_id`
     (docs/ledger/lp3-import-tables.md, change 2). Counts go into `out`."""
     # (4f) library_import_links: the unique key (user_id, source, source_kind, source_id) does not
     # involve the item, so the re-point cannot conflict. An `item` row's target is the item itself.
@@ -1039,6 +1045,19 @@ def _fold_server_children(cur, l_id, w_id, out: dict[str, int]) -> None:
         cur.execute("UPDATE library_server_fetches SET library_item_id = %s WHERE library_item_id = %s",
                     [w_id, l_id])
         out["server_fetches_moved"] += cur.rowcount
+
+    # (4k) library_capture_ids (111): a capture id names the item its capture made, so a replay must answer
+    # the winner. The key (user_id, capture_id) does not hold the item, so the re-point cannot conflict.
+    if has_table(cur, "public.library_capture_ids"):
+        cur.execute("UPDATE library_capture_ids SET library_item_id = %s WHERE library_item_id = %s",
+                    [w_id, l_id])
+        out["capture_ids_moved"] += cur.rowcount
+
+    # get_pdf_attach_claims (111) has no pass: a claim belongs to the attach run working on the loser, and
+    # moving it would clash with the winner's own claim on the primary key. Counted, not moved.
+    if has_table(cur, "public.get_pdf_attach_claims"):
+        cur.execute("SELECT count(*) FROM get_pdf_attach_claims WHERE library_item_id = %s", [l_id])
+        out["attach_claims_left"] += cur.fetchone()[0]
 
 
 def merge_library_items(cur, loser: str, winner: str) -> dict[str, int]:
